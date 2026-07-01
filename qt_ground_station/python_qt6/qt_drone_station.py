@@ -822,7 +822,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.metric_table, 1)
         self.set_metric("无人机 IP", "192.168.0.1")
         self.set_metric("WiFi 协议", "WiFi UFO UDP 40000")
-        self.set_metric("串口飞控", "COM9 / Cleanflight SPRACINGF3")
+        self.set_metric("串口飞控", "未连接")
         self.set_metric("安全锁", "未解锁")
         return page
 
@@ -1314,6 +1314,9 @@ class MainWindow(QMainWindow):
     def update_telemetry(self, values: dict) -> None:
         for key, value in values.items():
             self.set_metric(str(key), str(value))
+        if "飞控固件" in values and self.serial_worker:
+            port_info = f"{self.serial_worker.port_label} / {values['飞控固件']}"
+            self.set_metric("串口飞控", port_info)
 
     @Slot(QImage)
     def update_video(self, frame: QImage) -> None:
@@ -1370,6 +1373,9 @@ class MainWindow(QMainWindow):
                 "QLabel { background:#ecfdf5; color:#065f46; border:1px solid #a7f3d0; "
                 "border-radius:6px; padding:6px 10px; font-weight:500; }"
             )
+            if self.serial_worker:
+                port_info = f"{self.serial_worker.port_label} @ {self.serial_worker.baud}"
+                self.set_metric("串口飞控", port_info)
         elif "未连接" in status or "失败" in status:
             self.serial_status.setStyleSheet(
                 "QLabel { background:#fef2f2; color:#991b1b; border:1px solid #fecaca; "
@@ -1380,6 +1386,7 @@ class MainWindow(QMainWindow):
                 "QLabel { background:#fef2f2; color:#991b1b; border:1px solid #fecaca; "
                 "border-radius:6px; padding:6px 10px; font-weight:500; }"
             )
+            self.set_metric("串口飞控", "未连接")
         self.statusBar().showMessage(status, 4000)
 
     @Slot(str)
