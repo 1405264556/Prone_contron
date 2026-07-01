@@ -2,10 +2,10 @@
 
 
 a = Analysis(
-    ['qt_ground_station\\python_qt6\\qt_drone_station.py'],
+    ['qt_drone_station.py'],
     pathex=[],
     binaries=[],
-    datas=[('qt_ground_station/python_qt6', 'python_qt6')],
+    datas=[],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
