@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import QByteArray, QDateTime, QThread, Qt, Signal, Slot
-from PySide6.QtGui import QFont, QImage, QKeyEvent, QPixmap
+from PySide6.QtGui import QAction, QFont, QIcon, QImage, QKeyEvent, QPixmap
 from PySide6.QtSerialPort import QSerialPort, QSerialPortInfo
 from PySide6.QtWidgets import (
     QApplication,
@@ -52,14 +52,20 @@ def clamp_byte(value: int) -> int:
     return max(0, min(255, int(value)))
 
 
-def card_label(text: str, accent: str = "#f6f8fb") -> QLabel:
+def card_label(text: str, accent: str = "#f0f4f8", color: str = "#334155") -> QLabel:
     label = QLabel(text)
     label.setAlignment(Qt.AlignCenter)
-    label.setMinimumHeight(30)
+    label.setMinimumHeight(32)
     label.setStyleSheet(
-        f"QLabel {{ background:{accent}; border:1px solid #d2dbe8; border-radius:4px; padding:6px; }}"
+        f"QLabel {{ background:{accent}; color:{color}; border:1px solid #d4dce8; "
+        f"border-radius:6px; padding:6px 10px; font-weight:500; }}"
     )
     return label
+
+
+def status_dot(color: str) -> str:
+    """返回带颜色圆点的 HTML 状态文本前缀."""
+    return f"<span style='color:{color};font-size:14px;'>&#9679;</span> "
 
 
 @dataclass
@@ -502,25 +508,64 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         self.setWindowTitle("无人机 Qt6 可视化上位机")
-        self.resize(1380, 860)
+        self.resize(1400, 880)
         self.setMinimumSize(1180, 720)
         self.setStatusBar(QStatusBar(self))
-        self.setStyleSheet(
-            """
+        self.setStyleSheet("""
             QMainWindow { background:#eef2f7; }
-            QGroupBox { font-weight:600; border:1px solid #cfd8e5; border-radius:6px; margin-top:10px; background:white; }
-            QGroupBox::title { subcontrol-origin: margin; left:10px; padding:0 4px; }
-            QPushButton { background:white; border:1px solid #b9c4d4; border-radius:4px; padding:6px 10px; }
-            QPushButton:hover { background:#edf5ff; border-color:#5b8def; }
+            QGroupBox {
+                font-weight:600; font-size:13px; color:#1e293b;
+                border:1px solid #d5dde8; border-radius:8px;
+                margin-top:14px; padding-top:8px; background:white;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin; left:12px; padding:0 6px;
+                color:#2563eb;
+            }
+            QPushButton {
+                background:white; border:1px solid #c4cdd9; border-radius:5px;
+                padding:7px 14px; color:#334155; font-weight:500;
+            }
+            QPushButton:hover { background:#eff6ff; border-color:#3b82f6; color:#1d4ed8; }
             QPushButton:pressed { background:#dbeafe; }
-            QLineEdit, QSpinBox, QComboBox { background:white; border:1px solid #b9c4d4; border-radius:4px; padding:4px; }
-            QTabWidget::pane { border:1px solid #cfd8e5; background:white; }
-            """
-        )
+            QPushButton#danger { background:#fef2f2; border-color:#fca5a5; color:#991b1b; }
+            QPushButton#danger:hover { background:#fee2e2; border-color:#ef4444; }
+            QPushButton#primary { background:#2563eb; border-color:#2563eb; color:white; }
+            QPushButton#primary:hover { background:#1d4ed8; }
+            QLineEdit, QSpinBox, QComboBox {
+                background:white; border:1px solid #c4cdd9; border-radius:5px;
+                padding:5px; color:#334155;
+            }
+            QLineEdit:focus, QSpinBox:focus, QComboBox:focus { border-color:#3b82f6; }
+            QSlider::groove:horizontal { border-radius:3px; height:6px; background:#dde3ed; }
+            QSlider::handle:horizontal {
+                background:#2563eb; border-radius:8px; width:16px;
+                margin:-5px 0; border:2px solid white;
+            }
+            QSlider::handle:horizontal:hover { background:#1d4ed8; }
+            QSlider::sub-page:horizontal { background:#93c5fd; border-radius:3px; }
+            QTabWidget::pane { border:1px solid #d5dde8; border-radius:6px; background:white; }
+            QTabBar::tab {
+                background:#f1f5f9; border:1px solid #d5dde8; border-bottom:none;
+                border-radius:6px 6px 0 0; padding:8px 18px; margin-right:2px;
+                color:#64748b;
+            }
+            QTabBar::tab:selected { background:white; color:#2563eb; font-weight:600; }
+            QTabBar::tab:hover { color:#1d4ed8; }
+            QTableWidget { gridline-color:#e8ecf1; border:1px solid #d5dde8; border-radius:4px; }
+            QTableWidget::item { padding:5px 8px; }
+            QHeaderView::section { background:#f8fafc; border:1px solid #e8ecf1; padding:6px; font-weight:600; }
+            QCheckBox { color:#334155; spacing:8px; }
+            QCheckBox::indicator { width:18px; height:18px; border-radius:3px; }
+            QPlainTextEdit { border:1px solid #d5dde8; border-radius:5px; background:#fafbfc; }
+            QStatusBar { background:#f1f5f9; border-top:1px solid #d5dde8; color:#64748b; }
+        """)
+
+        self._setup_menubar()
 
         central = QWidget(self)
         root = QVBoxLayout(central)
-        root.setContentsMargins(10, 10, 10, 10)
+        root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(8)
         root.addWidget(self._top_panel())
 
@@ -533,71 +578,141 @@ class MainWindow(QMainWindow):
         self.control_tab = self._control_tab()
         self.dev_tab = self._developer_tab()
         self.safety_tab = self._safety_tab()
-        self.monitor_index = self.tabs.addTab(self.monitor_tab, "监控")
-        self.control_index = self.tabs.addTab(self.control_tab, "飞行控制")
-        self.dev_index = self.tabs.addTab(self.dev_tab, "开发者")
-        self.safety_index = self.tabs.addTab(self.safety_tab, "安全/说明")
+        self.monitor_index = self.tabs.addTab(self.monitor_tab, "📊 监控")
+        self.control_index = self.tabs.addTab(self.control_tab, "🎮 飞行控制")
+        self.dev_index = self.tabs.addTab(self.dev_tab, "🔧 开发者")
+        self.safety_index = self.tabs.addTab(self.safety_tab, "📋 安全/说明")
         splitter.addWidget(self.tabs)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
         root.addWidget(splitter, 1)
         self.setCentralWidget(central)
 
+    def _setup_menubar(self) -> None:
+        menubar = self.menuBar()
+        menubar.setStyleSheet(
+            "QMenuBar { background:white; border-bottom:1px solid #d5dde8; padding:2px; }"
+            "QMenuBar::item { padding:4px 12px; border-radius:4px; }"
+            "QMenuBar::item:selected { background:#eff6ff; }"
+            "QMenu { background:white; border:1px solid #d5dde8; border-radius:6px; padding:4px; }"
+            "QMenu::item { padding:6px 28px; border-radius:4px; }"
+            "QMenu::item:selected { background:#eff6ff; color:#1d4ed8; }"
+            "QMenu::separator { height:1px; background:#e8ecf1; margin:4px 8px; }"
+        )
+
+        file_menu = menubar.addMenu("文件(&F)")
+        refresh_action = QAction("刷新串口列表", self)
+        refresh_action.triggered.connect(self.refresh_ports)
+        file_menu.addAction(refresh_action)
+        file_menu.addSeparator()
+        exit_action = QAction("退出(&X)", self)
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
+
+        view_menu = menubar.addMenu("视图(&V)")
+        self.toggle_dev_action = QAction("开发者界面", self)
+        self.toggle_dev_action.setCheckable(True)
+        self.toggle_dev_action.triggered.connect(
+            lambda checked: self.mode_combo.setCurrentText("开发者界面" if checked else "使用者界面")
+        )
+        view_menu.addAction(self.toggle_dev_action)
+        view_menu.addSeparator()
+        clear_log_action = QAction("清空运行日志", self)
+        clear_log_action.triggered.connect(lambda: self.log_edit.clear())
+        view_menu.addAction(clear_log_action)
+
+        help_menu = menubar.addMenu("帮助(&H)")
+        about_action = QAction("关于(&A)", self)
+        about_action.triggered.connect(
+            lambda: QMessageBox.about(
+                self, "关于",
+                "无人机 Qt6 可视化上位机 v2.0\n\n"
+                "WiFi UFO 协议无人机地面站\n"
+                "支持图传接收、飞行控制、Cleanflight CLI 调试\n\n"
+                "基于 PySide6 / Qt6 构建",
+            )
+        )
+        help_menu.addAction(about_action)
+
     def _top_panel(self) -> QGroupBox:
         group = QGroupBox("连接配置")
         layout = QGridLayout(group)
+        layout.setVerticalSpacing(6)
+        layout.setHorizontalSpacing(8)
+
+        # --- Row 0: 界面模式 + 协议 ---
+        layout.addWidget(QLabel("界面模式"), 0, 0)
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["使用者界面", "开发者界面"])
+        self.mode_combo.setToolTip("使用者界面隐藏开发者 CLI 标签页")
+        layout.addWidget(self.mode_combo, 0, 1)
+
+        layout.addWidget(QLabel("协议"), 0, 2)
         self.profile_combo = QComboBox()
         self.profile_combo.addItems(["WiFi UFO UDP", "Tello 兼容 UDP", "仅串口 Cleanflight"])
+        self.profile_combo.setToolTip("选择通信协议，自动配置默认端口")
+        layout.addWidget(self.profile_combo, 0, 3)
+
+        # UDP 状态指示
+        self.udp_status = card_label("UDP 未连接", "#fef2f2", "#991b1b")
+        layout.addWidget(self.udp_status, 0, 4, 1, 2)
+
+        # --- Row 1: UDP 配置 ---
+        layout.addWidget(QLabel("无人机 IP"), 1, 0)
         self.ip_edit = QLineEdit("192.168.0.1")
+        self.ip_edit.setToolTip("无人机 WiFi 模块 IP 地址")
+        layout.addWidget(self.ip_edit, 1, 1)
+
+        layout.addWidget(QLabel("远端端口"), 1, 2)
         self.remote_udp = QSpinBox()
         self.remote_udp.setRange(1, 65535)
         self.remote_udp.setValue(40000)
+        self.remote_udp.setToolTip("无人机 UDP 端口")
+        layout.addWidget(self.remote_udp, 1, 3)
+
+        layout.addWidget(QLabel("本地端口"), 1, 4)
         self.local_udp = QSpinBox()
         self.local_udp.setRange(1, 65535)
         self.local_udp.setValue(40000)
-        self.udp_status = card_label("UDP 未连接")
+        self.local_udp.setToolTip("本地上位机 UDP 监听端口")
+        layout.addWidget(self.local_udp, 1, 5)
 
+        open_udp = QPushButton("打开 UDP")
+        open_udp.setObjectName("primary")
+        open_udp.setToolTip("打开 UDP 连接，开始接收图传和发送控制")
+        close_udp = QPushButton("关闭 UDP")
+        heartbeat = QPushButton("UFO 心跳")
+        heartbeat.setToolTip("向无人机发送 WiFi UFO 心跳包，启动图传")
+        layout.addWidget(open_udp, 1, 6)
+        layout.addWidget(close_udp, 1, 7)
+        layout.addWidget(heartbeat, 1, 8)
+
+        # --- Row 2: 串口配置 ---
+        layout.addWidget(QLabel("飞控串口"), 2, 0)
         self.serial_combo = QComboBox()
-        self.serial_combo.setMinimumWidth(240)
+        self.serial_combo.setMinimumWidth(220)
+        self.serial_combo.setToolTip("选择飞控对应的串口")
+        layout.addWidget(self.serial_combo, 2, 1, 1, 3)
+
+        layout.addWidget(QLabel("波特率"), 2, 4)
         self.baud_spin = QSpinBox()
         self.baud_spin.setRange(1200, 2_000_000)
         self.baud_spin.setValue(115200)
-        self.serial_status = card_label("串口未连接")
+        self.baud_spin.setToolTip("串口波特率，Cleanflight 默认 115200")
+        layout.addWidget(self.baud_spin, 2, 5)
 
-        open_udp = QPushButton("打开 UDP")
-        close_udp = QPushButton("关闭 UDP")
-        heartbeat = QPushButton("UFO 心跳")
         refresh = QPushButton("刷新串口")
+        refresh.setToolTip("重新扫描可用串口列表")
         open_serial = QPushButton("连接串口")
+        open_serial.setToolTip("连接到选中的飞控串口")
         close_serial = QPushButton("关闭串口")
+        self.serial_status = card_label("串口未连接", "#fef2f2", "#991b1b")
+        layout.addWidget(refresh, 2, 6)
+        layout.addWidget(open_serial, 2, 7)
+        layout.addWidget(close_serial, 2, 8)
+        layout.addWidget(self.serial_status, 2, 9)
 
-        layout.addWidget(QLabel("界面"), 0, 0)
-        layout.addWidget(self.mode_combo, 0, 1)
-        layout.addWidget(QLabel("协议"), 0, 2)
-        layout.addWidget(self.profile_combo, 0, 3)
-        layout.addWidget(QLabel("无人机 IP"), 0, 4)
-        layout.addWidget(self.ip_edit, 0, 5)
-        layout.addWidget(QLabel("远端 UDP"), 0, 6)
-        layout.addWidget(self.remote_udp, 0, 7)
-        layout.addWidget(QLabel("本地 UDP"), 0, 8)
-        layout.addWidget(self.local_udp, 0, 9)
-        layout.addWidget(open_udp, 0, 10)
-        layout.addWidget(close_udp, 0, 11)
-        layout.addWidget(heartbeat, 0, 12)
-        layout.addWidget(self.udp_status, 0, 13)
-
-        layout.addWidget(QLabel("飞控串口"), 1, 0)
-        layout.addWidget(self.serial_combo, 1, 1, 1, 4)
-        layout.addWidget(QLabel("波特率"), 1, 5)
-        layout.addWidget(self.baud_spin, 1, 6)
-        layout.addWidget(refresh, 1, 7)
-        layout.addWidget(open_serial, 1, 8)
-        layout.addWidget(close_serial, 1, 9)
-        layout.addWidget(self.serial_status, 1, 10, 1, 4)
-        layout.setColumnStretch(13, 1)
-
+        # 连接信号
         self.mode_combo.currentTextChanged.connect(self.apply_interface_mode)
         self.profile_combo.currentTextChanged.connect(self.apply_profile)
         open_udp.clicked.connect(self.open_udp)
@@ -612,22 +727,35 @@ class MainWindow(QMainWindow):
         left = QWidget()
         layout = QVBoxLayout(left)
         layout.setContentsMargins(0, 0, 0, 0)
-        video_group = QGroupBox("图传预览 / 状态")
+        layout.setSpacing(8)
+
+        video_group = QGroupBox("图传预览")
         video_layout = QVBoxLayout(video_group)
-        self.video_label = QLabel("等待 WiFi UFO 视频流")
+        self.video_label = QLabel("等待 WiFi UFO 视频流...")
         self.video_label.setAlignment(Qt.AlignCenter)
         self.video_label.setMinimumSize(600, 380)
-        self.video_label.setStyleSheet("QLabel { background:#101820; color:#dce7f7; border-radius:4px; }")
-        self.video_stats = card_label("视频：未连接")
+        self.video_label.setStyleSheet(
+            "QLabel { background:#0f172a; color:#94a3b8; border-radius:6px; "
+            "border:1px solid #1e293b; font-size:14px; }"
+        )
+        self.video_stats = card_label("视频：等待连接", "#f8fafc", "#64748b")
         video_layout.addWidget(self.video_label, 1)
         video_layout.addWidget(self.video_stats)
         layout.addWidget(video_group, 3)
 
         log_group = QGroupBox("运行日志")
         log_layout = QVBoxLayout(log_group)
+        log_row = QHBoxLayout()
+        log_row.addStretch()
+        clear_btn = QPushButton("清空日志")
+        clear_btn.setToolTip("清空当前显示的运行日志")
+        clear_btn.clicked.connect(lambda: self.log_edit.clear())
+        log_row.addWidget(clear_btn)
+        log_layout.addLayout(log_row)
         self.log_edit = QPlainTextEdit()
         self.log_edit.setReadOnly(True)
-        self.log_edit.setMaximumBlockCount(1400)
+        self.log_edit.setMaximumBlockCount(2000)
+        self.log_edit.setFont(QFont("Consolas", 9))
         log_layout.addWidget(self.log_edit)
         layout.addWidget(log_group, 2)
         return left
@@ -635,49 +763,70 @@ class MainWindow(QMainWindow):
     def _monitor_tab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        quick = QGridLayout()
-        quick.addWidget(card_label("WiFi：WiFiUFO-3BE7F2"), 0, 0)
-        quick.addWidget(card_label("飞控：Cleanflight SPRACINGF3"), 0, 1)
-        quick.addWidget(card_label("控制：默认锁定"), 0, 2)
+        layout.setSpacing(8)
+
+        quick = QHBoxLayout()
+        self.quick_wifi = card_label("WiFi：等待连接", "#fef2f2", "#991b1b")
+        self.quick_fc = card_label("飞控：未连接", "#fef2f2", "#991b1b")
+        self.quick_lock = card_label("控制：默认锁定", "#fff7ed", "#c2410c")
+        self.quick_wifi.setMinimumHeight(48)
+        self.quick_fc.setMinimumHeight(48)
+        self.quick_lock.setMinimumHeight(48)
+        quick.addWidget(self.quick_wifi)
+        quick.addWidget(self.quick_fc)
+        quick.addWidget(self.quick_lock)
         layout.addLayout(quick)
+
         self.metric_table = QTableWidget(0, 2)
         self.metric_table.setHorizontalHeaderLabels(["字段", "值"])
         self.metric_table.horizontalHeader().setStretchLastSection(True)
         self.metric_table.verticalHeader().setVisible(False)
         self.metric_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.metric_table.setAlternatingRowColors(True)
+        self.metric_table.setStyleSheet(
+            "QTableWidget { alternate-background-color:#f8fafc; }"
+        )
         layout.addWidget(self.metric_table, 1)
         self.set_metric("无人机 IP", "192.168.0.1")
         self.set_metric("WiFi 协议", "WiFi UFO UDP 40000")
-        self.set_metric("串口飞控", "Cleanflight/SPRACINGF3 1.13.0")
+        self.set_metric("串口飞控", "COM9 / Cleanflight SPRACINGF3")
         self.set_metric("安全锁", "未解锁")
         return page
 
     def _control_tab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
+        layout.setSpacing(8)
 
         safety = QGroupBox("安全锁")
         safety_layout = QHBoxLayout(safety)
         self.unlock_check = QCheckBox("我已拆桨/固定机体，并确认允许发送飞行动作")
-        self.lock_label = card_label("控制锁定", "#fff7ed")
+        self.unlock_check.setToolTip("必须勾选此选项才能发送任何飞行控制指令")
+        self.lock_label = card_label("控制锁定", "#fff7ed", "#c2410c")
         safety_layout.addWidget(self.unlock_check, 1)
         safety_layout.addWidget(self.lock_label)
         layout.addWidget(safety)
 
-        self.command_status = card_label("当前命令：待机", "#eef6ff")
+        self.command_status = card_label("当前命令：待机", "#eff6ff", "#1e40af")
         layout.addWidget(self.command_status)
 
-        remote = QGroupBox("遥控器式快捷控制")
+        remote = QGroupBox("遥控器式快捷控制（短促脉冲）")
         remote_grid = QGridLayout(remote)
-        btn_up = QPushButton("前进 W / ↑")
-        btn_down = QPushButton("后退 S / ↓")
-        btn_left = QPushButton("左移 A")
-        btn_right = QPushButton("右移 D")
-        btn_yaw_l = QPushButton("左旋 Q")
-        btn_yaw_r = QPushButton("右旋 E")
-        btn_thr_up = QPushButton("升高 R")
-        btn_thr_down = QPushButton("降低 F")
-        btn_hover = QPushButton("悬停 Space")
+        remote_grid.setSpacing(6)
+        btn_style = "QPushButton { min-height:40px; font-weight:600; font-size:13px; }"
+        btn_up = QPushButton("↑ 前进 (W)")
+        btn_down = QPushButton("↓ 后退 (S)")
+        btn_left = QPushButton("← 左移 (A)")
+        btn_right = QPushButton("→ 右移 (D)")
+        btn_yaw_l = QPushButton("↺ 左旋 (Q)")
+        btn_yaw_r = QPushButton("↻ 右旋 (E)")
+        btn_thr_up = QPushButton("⇧ 升高 (R)")
+        btn_thr_down = QPushButton("⇩ 降低 (F)")
+        btn_hover = QPushButton("◎ 悬停 (Space)")
+        for btn in [btn_up, btn_down, btn_left, btn_right, btn_yaw_l, btn_yaw_r,
+                     btn_thr_up, btn_thr_down, btn_hover]:
+            btn.setStyleSheet(btn_style)
+        btn_hover.setObjectName("primary")
         remote_grid.addWidget(btn_thr_up, 0, 0)
         remote_grid.addWidget(btn_up, 0, 1)
         remote_grid.addWidget(btn_yaw_r, 0, 2)
@@ -689,38 +838,54 @@ class MainWindow(QMainWindow):
         remote_grid.addWidget(btn_yaw_l, 2, 2)
         layout.addWidget(remote)
 
-        manual = QGroupBox("连续控制量")
+        manual = QGroupBox("连续控制量（滑块调节）")
         grid = QGridLayout(manual)
+        grid.setSpacing(8)
         self.roll = self._slider(0, 255, 128)
         self.pitch = self._slider(0, 255, 128)
         self.throttle = self._slider(0, 255, 128)
         self.yaw = self._slider(0, 255, 128)
-        self.roll_value = card_label("128")
-        self.pitch_value = card_label("128")
-        self.throttle_value = card_label("128")
-        self.yaw_value = card_label("128")
+        self.roll_value = card_label("128", "#f1f5f9", "#334155")
+        self.pitch_value = card_label("128", "#f1f5f9", "#334155")
+        self.throttle_value = card_label("128", "#f1f5f9", "#334155")
+        self.yaw_value = card_label("128", "#f1f5f9", "#334155")
         rows = [
-            ("横滚 Roll", self.roll, self.roll_value),
-            ("俯仰 Pitch", self.pitch, self.pitch_value),
-            ("油门 Throttle", self.throttle, self.throttle_value),
-            ("偏航 Yaw", self.yaw, self.yaw_value),
+            ("横滚 Roll", self.roll, self.roll_value, "左右倾斜"),
+            ("俯仰 Pitch", self.pitch, self.pitch_value, "前后倾斜"),
+            ("油门 Throttle", self.throttle, self.throttle_value, "上升下降力度"),
+            ("偏航 Yaw", self.yaw, self.yaw_value, "左右旋转"),
         ]
-        for row, (name, slider, value_label) in enumerate(rows):
-            grid.addWidget(QLabel(name), row, 0)
+        for row, (name, slider, value_label, tip) in enumerate(rows):
+            name_label = QLabel(name)
+            name_label.setToolTip(tip)
+            name_label.setMinimumWidth(100)
+            grid.addWidget(name_label, row, 0)
             grid.addWidget(slider, row, 1)
             grid.addWidget(value_label, row, 2)
         grid.setColumnStretch(1, 1)
         layout.addWidget(manual)
 
         buttons = QGridLayout()
-        self.start_control = QPushButton("启动连续控制")
-        self.stop_control = QPushButton("停止连续控制")
-        neutral = QPushButton("悬停/回中")
-        zero_throttle = QPushButton("油门归零")
-        takeoff = QPushButton("起飞")
-        land = QPushButton("降落")
-        hard_stop = QPushButton("急停")
-        hard_stop.setStyleSheet("QPushButton { background:#fff1f2; border-color:#fb7185; color:#9f1239; }")
+        buttons.setSpacing(6)
+        self.start_control = QPushButton("▶ 启动连续控制")
+        self.start_control.setToolTip("按 50ms 间隔持续发送当前滑块位置的控制指令")
+        self.stop_control = QPushButton("⏹ 停止连续控制")
+        self.stop_control.setToolTip("停止发送连续控制指令")
+        neutral = QPushButton("◎ 悬停/回中")
+        neutral.setToolTip("将所有控制量重置为中间值 128")
+        zero_throttle = QPushButton("⬇ 油门归零")
+        zero_throttle.setToolTip("将油门值设为 0（停止转动）")
+        takeoff = QPushButton("🛫 起飞")
+        takeoff.setToolTip("连续发送 1 秒起飞指令脉冲")
+        land = QPushButton("🛬 降落")
+        land.setToolTip("连续发送 1 秒降落指令脉冲")
+        hard_stop = QPushButton("⚠ 急停")
+        hard_stop.setObjectName("danger")
+        hard_stop.setToolTip("立即发送急停指令——可能导致飞行器直接掉落！")
+        for btn in [self.start_control, self.stop_control, neutral, zero_throttle,
+                     takeoff, land, hard_stop]:
+            btn.setMinimumHeight(38)
+        self.start_control.setObjectName("primary")
         buttons.addWidget(self.start_control, 0, 0)
         buttons.addWidget(self.stop_control, 0, 1)
         buttons.addWidget(neutral, 0, 2)
@@ -755,14 +920,22 @@ class MainWindow(QMainWindow):
     def _developer_tab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
+        layout.setSpacing(8)
+
         row = QHBoxLayout()
         version = QPushButton("version")
+        version.setToolTip("查询飞控固件版本")
         status = QPushButton("status")
+        status.setToolTip("查询飞控运行状态")
         dump = QPushButton("dump")
+        dump.setToolTip("导出飞控全部配置参数")
         enter_cli = QPushButton("进入 CLI (#)")
+        enter_cli.setToolTip("发送 # 进入 Cleanflight CLI 模式")
         self.cli_edit = QLineEdit()
-        self.cli_edit.setPlaceholderText("输入 Cleanflight CLI 命令，例如 help / version / status")
+        self.cli_edit.setPlaceholderText("输入 Cleanflight CLI 命令，如 help / version / status / dump ...")
         send = QPushButton("发送 CLI")
+        send.setToolTip("发送命令到飞控串口 CLI")
+        send.setObjectName("primary")
         row.addWidget(version)
         row.addWidget(status)
         row.addWidget(dump)
@@ -770,9 +943,14 @@ class MainWindow(QMainWindow):
         row.addWidget(self.cli_edit, 1)
         row.addWidget(send)
         layout.addLayout(row)
+
         self.serial_console = QPlainTextEdit()
         self.serial_console.setReadOnly(True)
         self.serial_console.setMaximumBlockCount(3000)
+        self.serial_console.setFont(QFont("Consolas", 9))
+        self.serial_console.setStyleSheet(
+            "QPlainTextEdit { background:#0f172a; color:#e2e8f0; border:1px solid #334155; }"
+        )
         layout.addWidget(self.serial_console, 1)
         version.clicked.connect(lambda: self.send_cli_line("version"))
         status.clicked.connect(lambda: self.send_cli_line("status"))
@@ -785,19 +963,55 @@ class MainWindow(QMainWindow):
     def _safety_tab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
+        layout.setSpacing(8)
+
+        title = QLabel("安全使用说明")
+        title.setStyleSheet("QLabel { font-size:16px; font-weight:700; color:#1e293b; padding:4px 0; }")
+        layout.addWidget(title)
+
         text = QLabel(
-            "使用步骤：\n"
-            "1. 先拆桨或固定机体，再连接 WiFiUFO-3BE7F2。\n"
-            "2. 点击“UFO 心跳”启动 WiFi UFO UDP 40000 图传。\n"
-            "3. 使用者界面只显示监控和飞行控制；开发者界面额外显示 CLI。\n"
-            "4. 快捷控制按钮会短促发送方向命令；连续控制需要点击“启动连续控制”。\n"
-            "5. 所有飞行动作默认锁定，必须确认安全后才会发出。\n\n"
-            "键盘快捷键：W/S 前后，A/D 左右，Q/E 旋转，R/F 升降，Space 悬停。\n"
-            "视频优化：后台线程接收 UDP，按 54 字节载荷偏移和分片序号重组 JPEG，丢弃坏帧并限帧显示。"
+            "<style>"
+            "  b { color:#2563eb; }"
+            "  .warn { color:#dc2626; font-weight:600; }"
+            "  li { margin:6px 0; line-height:1.6; }"
+            "</style>"
+            "<ol>"
+            "<li><b>拆桨或固定机体</b> —— 测试前务必拆掉螺旋桨或用夹具固定无人机。</li>"
+            "<li><b>连接无人机 WiFi</b> —— 将电脑连接到 <code>WiFiUFO-3BE7F2</code> 热点。</li>"
+            "<li><b>点击 UFO 心跳</b> —— 启动 WiFi UFO UDP 40000 图传和控制通道。</li>"
+            "<li><b>选择界面模式</b> —— 使用者界面只显示监控和飞行控制；开发者界面额外显示 CLI。</li>"
+            "<li><b>快捷控制按钮</b> —— 短促发送方向命令（约 0.45 秒后自动回中）。</li>"
+            "<li><b>连续控制</b> -- 点击 “启动连续控制” 后, 以 50ms 间隔持续发送滑块控制量。</li>"
+            "<li class='warn'>所有飞行动作默认锁定，必须勾选安全确认后才会发出！</li>"
+            "</ol>"
+            "<br><b>键盘快捷键：</b><br>"
+            "<table cellspacing='4'>"
+            "<tr><td><b>W / ↑</b></td><td>前进</td>"
+            "<td width='20'></td><td><b>S / ↓</b></td><td>后退</td></tr>"
+            "<tr><td><b>A</b></td><td>左移</td>"
+            "<td></td><td><b>D</b></td><td>右移</td></tr>"
+            "<tr><td><b>Q</b></td><td>左旋</td>"
+            "<td></td><td><b>E</b></td><td>右旋</td></tr>"
+            "<tr><td><b>R</b></td><td>升高</td>"
+            "<td></td><td><b>F</b></td><td>降低</td></tr>"
+            "<tr><td><b>Space</b></td><td>悬停/回中</td><td></td><td></td><td></td></tr>"
+            "</table>"
+            "<br><b>控制协议参考：</b><br>"
+            "WiFi UFO 控制包格式：<code>63 63 0a 00 00 08 00 66 [R] [P] [T] [Y] [M] [XOR]</code><br>"
+            "字节 8-11: Roll / Pitch / Throttle / Yaw (0-255, 128=中位)<br>"
+            "字节 12: 模式 (0=普通, 1=起飞, 2=降落, 4=急停)<br>"
+            "字节 13: 字节 8-12 的 XOR 校验<br>"
+            "<br><b>视频处理说明：</b><br>"
+            "后台线程接收 UDP 视频分片，按 54 字节 JPEG 载荷偏移和分片序号重组，<br>"
+            "丢弃尺寸变化的坏帧并以约 18 FPS 限帧显示，减少彩色闪烁伪影。"
         )
         text.setWordWrap(True)
         text.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        text.setStyleSheet("QLabel { background:white; padding:12px; border:1px solid #cfd8e5; border-radius:6px; }")
+        text.setTextFormat(Qt.RichText)
+        text.setStyleSheet(
+            "QLabel { background:white; padding:16px; border:1px solid #d5dde8; "
+            "border-radius:8px; color:#334155; line-height:1.8; }"
+        )
         layout.addWidget(text)
         layout.addStretch(1)
         return page
@@ -812,7 +1026,7 @@ class MainWindow(QMainWindow):
 
     def _connect_serial(self, worker: CleanflightSerialClient) -> None:
         worker.log_message.connect(self.append_log)
-        worker.status_changed.connect(self.serial_status.setText)
+        worker.status_changed.connect(self._serial_status)
         worker.text_received.connect(self.append_serial)
         worker.telemetry.connect(self.update_telemetry)
 
@@ -853,6 +1067,8 @@ class MainWindow(QMainWindow):
     def apply_interface_mode(self) -> None:
         developer = self.mode_combo.currentText() == "开发者界面"
         self.tabs.setTabVisible(self.dev_index, developer)
+        if hasattr(self, 'toggle_dev_action'):
+            self.toggle_dev_action.setChecked(developer)
         if not developer and self.tabs.currentIndex() == self.dev_index:
             self.tabs.setCurrentIndex(self.monitor_index)
         self.append_log(f"界面模式：{self.mode_combo.currentText()}")
@@ -942,18 +1158,35 @@ class MainWindow(QMainWindow):
 
     @Slot(bool)
     def _unlock_changed(self, checked: bool) -> None:
-        self.lock_label.setText("控制已解锁" if checked else "控制锁定")
-        self.lock_label.setStyleSheet(
-            "QLabel { background:%s; border:1px solid #d2dbe8; border-radius:4px; padding:6px; }"
-            % ("#ecfdf5" if checked else "#fff7ed")
-        )
+        if checked:
+            self.lock_label.setText("控制已解锁")
+            self.lock_label.setStyleSheet(
+                "QLabel { background:#ecfdf5; color:#065f46; border:1px solid #a7f3d0; "
+                "border-radius:6px; padding:6px 10px; font-weight:500; }"
+            )
+            self.quick_lock.setText("控制：已解锁")
+            self.quick_lock.setStyleSheet(
+                "QLabel { background:#ecfdf5; color:#065f46; border:1px solid #a7f3d0; "
+                "border-radius:6px; padding:6px 10px; font-weight:500; }"
+            )
+        else:
+            self.lock_label.setText("控制锁定")
+            self.lock_label.setStyleSheet(
+                "QLabel { background:#fff7ed; color:#c2410c; border:1px solid #fed7aa; "
+                "border-radius:6px; padding:6px 10px; font-weight:500; }"
+            )
+            self.quick_lock.setText("控制：默认锁定")
+            self.quick_lock.setStyleSheet(
+                "QLabel { background:#fff7ed; color:#c2410c; border:1px solid #fed7aa; "
+                "border-radius:6px; padding:6px 10px; font-weight:500; }"
+            )
         self.set_metric("安全锁", "已解锁" if checked else "未解锁")
         self.append_log("安全锁已手动解锁" if checked else "安全锁已锁定")
 
     def ensure_unlocked(self, action: str) -> bool:
         if self.unlock_check.isChecked():
             return True
-        QMessageBox.warning(self, "控制已锁定", f"“{action}”需要先勾选安全锁。请确认拆桨或固定机体后再解锁。")
+        QMessageBox.warning(self, "控制已锁定", f"“{action}” 需要先勾选安全锁。请确认拆桨或固定机体后再解锁。")
         self.append_log(f"已阻止动作：{action}，原因：安全锁未解锁")
         return False
 
@@ -1058,7 +1291,52 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def _udp_status(self, status: str) -> None:
         self.udp_status.setText(status)
-        self.statusBar().showMessage(status, 3000)
+        if "已连接" in status or "发送中" in status:
+            self.udp_status.setStyleSheet(
+                "QLabel { background:#ecfdf5; color:#065f46; border:1px solid #a7f3d0; "
+                "border-radius:6px; padding:6px 10px; font-weight:500; }"
+            )
+            self.quick_wifi.setText("WiFi：UDP 已连接")
+            self.quick_wifi.setStyleSheet(
+                "QLabel { background:#ecfdf5; color:#065f46; border:1px solid #a7f3d0; "
+                "border-radius:6px; padding:6px 10px; font-weight:500; }"
+            )
+        elif "断开" in status or "错误" in status:
+            self.udp_status.setStyleSheet(
+                "QLabel { background:#fef2f2; color:#991b1b; border:1px solid #fecaca; "
+                "border-radius:6px; padding:6px 10px; font-weight:500; }"
+            )
+            self.quick_wifi.setText("WiFi：已断开")
+            self.quick_wifi.setStyleSheet(
+                "QLabel { background:#fef2f2; color:#991b1b; border:1px solid #fecaca; "
+                "border-radius:6px; padding:6px 10px; font-weight:500; }"
+            )
+        self.statusBar().showMessage(status, 4000)
+
+    @Slot(str)
+    def _serial_status(self, status: str) -> None:
+        self.serial_status.setText(status)
+        if "已连接" in status:
+            self.serial_status.setStyleSheet(
+                "QLabel { background:#ecfdf5; color:#065f46; border:1px solid #a7f3d0; "
+                "border-radius:6px; padding:6px 10px; font-weight:500; }"
+            )
+            self.quick_fc.setText("飞控：已连接")
+            self.quick_fc.setStyleSheet(
+                "QLabel { background:#ecfdf5; color:#065f46; border:1px solid #a7f3d0; "
+                "border-radius:6px; padding:6px 10px; font-weight:500; }"
+            )
+        elif "未连接" in status or "失败" in status:
+            self.serial_status.setStyleSheet(
+                "QLabel { background:#fef2f2; color:#991b1b; border:1px solid #fecaca; "
+                "border-radius:6px; padding:6px 10px; font-weight:500; }"
+            )
+            self.quick_fc.setText("飞控：未连接")
+            self.quick_fc.setStyleSheet(
+                "QLabel { background:#fef2f2; color:#991b1b; border:1px solid #fecaca; "
+                "border-radius:6px; padding:6px 10px; font-weight:500; }"
+            )
+        self.statusBar().showMessage(status, 4000)
 
     @Slot(str)
     def control_packet_sent(self, message: str) -> None:
