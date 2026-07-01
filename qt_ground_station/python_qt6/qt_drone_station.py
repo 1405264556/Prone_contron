@@ -220,19 +220,20 @@ class WifiUfoWorker(QThread):
     def _tick_control(self, sock: socket.socket) -> None:
         now = time.monotonic()
 
-        # --- 持续心跳：每秒发送一次，维持无人机连接 ---
-        if now - self.last_heartbeat_at >= 1.0:
-            self._send(sock, WIFI_UFO_HEARTBEAT)
-            self.last_heartbeat_at = now
-
         if now < self.next_control_at:
+            # 空闲时才发心跳，避免和控制包挤在同一个 tick
+            if now - self.last_heartbeat_at >= 0.5:
+                self._send(sock, WIFI_UFO_HEARTBEAT)
+                self.last_heartbeat_at = now
             return
+
+        sent_control = False
 
         # --- 优先级 1: 突发指令 (起飞/降落/急停) ---
         if self.burst_until > now:
             self._send_control(sock, ControlState(), self.burst_mode, self.burst_label)
             self.next_control_at = now + CONTROL_INTERVAL
-            return
+            sent_control = True
 
         if self.burst_until and self.burst_until <= now:
             self.log_message.emit(f"{self.burst_label}指令脉冲结束")
@@ -245,18 +246,23 @@ class WifiUfoWorker(QThread):
                 self.log_message.emit("起飞完成，进入待机怠速状态（电机低频旋转）")
                 self.status_changed.emit("待机中")
             self.next_control_at = now + CONTROL_INTERVAL
-            return
+            sent_control = True
 
         # --- 优先级 2: 持续按键保持 ---
-        if self.hold_active:
+        if not sent_control and self.hold_active:
             self._send_control(sock, self.hold_state, 0, self.hold_label)
             self.next_control_at = now + CONTROL_INTERVAL
-            return
+            sent_control = True
 
         # --- 优先级 3: 滑块连续控制流 ---
-        if self.control_stream:
+        if not sent_control and self.control_stream:
             self._send_control(sock, self.control, 0, "手动控制")
             self.next_control_at = now + CONTROL_INTERVAL
+            sent_control = True
+
+        # 控制包本身维持连接，重置心跳计时器避免心跳紧跟在控制包之后
+        if sent_control:
+            self.last_heartbeat_at = now
 
     def _parse_datagram(self, data: bytes, addr: tuple[str, int]) -> None:
         if not data.startswith(b"cc"):
@@ -1270,11 +1276,11 @@ class MainWindow(QMainWindow):
         ):
             self.open_udp()
             if self.wifi_worker:
-                # 先停掉可能残留的 hold/stream
-                self.wifi_worker.enqueue(("hold_stop",))
-                self.wifi_worker.enqueue(("stop_stream",))
-                # 发送起飞脉冲 → 自动进入待机怠速
-                self.wifi_worker.enqueue(("burst", 1, "解锁", 1.0, True))
+                # 先发心跳预热连接，确保无人机已就绪
+                self.wifi_worker.enqueue(("heartbeat",))
+                self.wifi_worker.enqueue(("heartbeat",))
+                # 发送 2 秒起飞脉冲 → 自动进入待机怠速
+                self.wifi_worker.enqueue(("burst", 1, "解锁", 2.0, True))
                 self.command_status.setText("当前命令：解锁中...")
 
     @Slot()
