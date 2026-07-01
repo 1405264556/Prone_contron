@@ -105,9 +105,11 @@ class WifiUfoWorker(QThread):
         self.burst_until = 0.0
         self.burst_mode = 0
         self.burst_label = ""
-        self.nudge_until = 0.0
-        self.nudge_state = ControlState()
-        self.nudge_label = ""
+        self.burst_auto_hover = False
+        self.hold_active = False
+        self.hold_state = ControlState()
+        self.hold_label = ""
+        self._pending_center = False
 
         self.frame_buffer = bytearray()
         self.frame_open = False
@@ -181,12 +183,19 @@ class WifiUfoWorker(QThread):
                 self.burst_mode = int(command[1])
                 self.burst_label = str(command[2])
                 self.burst_until = time.monotonic() + float(command[3])
+                self.burst_auto_hover = len(command) > 4 and bool(command[4])
                 self.log_message.emit(f"开始发送{self.burst_label}指令脉冲 {command[3]:.1f} 秒")
-            elif name == "nudge":
-                self.nudge_state = command[1].clamped()
-                self.nudge_label = str(command[2])
-                self.nudge_until = time.monotonic() + float(command[3])
-                self.log_message.emit(f"短促控制：{self.nudge_label}")
+            elif name == "hold_start":
+                self.hold_state = command[1].clamped()
+                self.hold_label = str(command[2]) if len(command) > 2 else ""
+                self.hold_active = True
+                self.next_control_at = 0.0
+                self.log_message.emit(f"持续控制开始：{self.hold_label}")
+                self.status_changed.emit("持续控制中")
+            elif name == "hold_stop":
+                self.hold_active = False
+                self._pending_center = True
+                self.log_message.emit(f"持续控制停止：{self.hold_label}")
 
     def _read_socket(self, sock: socket.socket) -> None:
         while True:
@@ -203,24 +212,42 @@ class WifiUfoWorker(QThread):
         if now < self.next_control_at:
             return
 
+        # --- 优先级 1: 突发指令 (起飞/降落/急停) ---
         if self.burst_until > now:
             self._send_control(sock, ControlState(), self.burst_mode, self.burst_label)
             self.next_control_at = now + CONTROL_INTERVAL
             return
+
         if self.burst_until and self.burst_until <= now:
             self.log_message.emit(f"{self.burst_label}指令脉冲结束")
             self.burst_until = 0.0
-
-        if self.nudge_until > now:
-            self._send_control(sock, self.nudge_state, 0, self.nudge_label)
+            if self.burst_auto_hover:
+                # 起飞后自动进入悬停保持
+                self.hold_state = ControlState(128, 128, 128, 128)
+                self.hold_active = True
+                self.hold_label = "自动悬停"
+                self.log_message.emit("起飞完成，自动进入悬停保持")
+                self.status_changed.emit("悬停保持中")
             self.next_control_at = now + CONTROL_INTERVAL
             return
-        if self.nudge_until and self.nudge_until <= now:
+
+        # --- 优先级 2: 回中补偿 (松开按键时发送一次回中) ---
+        if self._pending_center:
             self._send_control(sock, ControlState(), 0, "回中")
-            self.nudge_until = 0.0
+            self._pending_center = False
+            self.next_control_at = now + CONTROL_INTERVAL
+            self.status_changed.emit("UDP 已连接")
+            if not self.hold_active and not self.control_stream:
+                return
+            # 如果还有 hold 或 stream 活跃，继续往下走
+
+        # --- 优先级 3: 持续按键保持 ---
+        if self.hold_active:
+            self._send_control(sock, self.hold_state, 0, self.hold_label)
             self.next_control_at = now + CONTROL_INTERVAL
             return
 
+        # --- 优先级 4: 滑块连续控制流 ---
         if self.control_stream:
             self._send_control(sock, self.control, 0, "手动控制")
             self.next_control_at = now + CONTROL_INTERVAL
@@ -810,35 +837,36 @@ class MainWindow(QMainWindow):
         self.command_status = card_label("当前命令：待机", "#eff6ff", "#1e40af")
         layout.addWidget(self.command_status)
 
-        remote = QGroupBox("遥控器式快捷控制（短促脉冲）")
+        remote = QGroupBox("键盘/鼠标持续控制（按下持续发送，松开自动回中）")
         remote_grid = QGridLayout(remote)
         remote_grid.setSpacing(6)
-        btn_style = "QPushButton { min-height:40px; font-weight:600; font-size:13px; }"
-        btn_up = QPushButton("↑ 前进 (W)")
-        btn_down = QPushButton("↓ 后退 (S)")
-        btn_left = QPushButton("← 左移 (A)")
-        btn_right = QPushButton("→ 右移 (D)")
-        btn_yaw_l = QPushButton("↺ 左旋 (Q)")
-        btn_yaw_r = QPushButton("↻ 右旋 (E)")
-        btn_thr_up = QPushButton("⇧ 升高 (R)")
-        btn_thr_down = QPushButton("⇩ 降低 (F)")
-        btn_hover = QPushButton("◎ 悬停 (Space)")
-        for btn in [btn_up, btn_down, btn_left, btn_right, btn_yaw_l, btn_yaw_r,
-                     btn_thr_up, btn_thr_down, btn_hover]:
+        btn_style = "QPushButton { min-height:44px; font-weight:600; font-size:13px; }"
+        self.btn_up = QPushButton("↑ 前进 (W)")
+        self.btn_down = QPushButton("↓ 后退 (S)")
+        self.btn_left = QPushButton("← 左移 (A)")
+        self.btn_right = QPushButton("→ 右移 (D)")
+        self.btn_yaw_l = QPushButton("↺ 左旋 (Q)")
+        self.btn_yaw_r = QPushButton("↻ 右旋 (E)")
+        self.btn_thr_up = QPushButton("⇧ 升高 (R)")
+        self.btn_thr_down = QPushButton("⇩ 降低 (F)")
+        self.btn_hover = QPushButton("◎ 悬停 (Space)")
+        for btn in [self.btn_up, self.btn_down, self.btn_left, self.btn_right,
+                     self.btn_yaw_l, self.btn_yaw_r, self.btn_thr_up, self.btn_thr_down,
+                     self.btn_hover]:
             btn.setStyleSheet(btn_style)
-        btn_hover.setObjectName("primary")
-        remote_grid.addWidget(btn_thr_up, 0, 0)
-        remote_grid.addWidget(btn_up, 0, 1)
-        remote_grid.addWidget(btn_yaw_r, 0, 2)
-        remote_grid.addWidget(btn_left, 1, 0)
-        remote_grid.addWidget(btn_hover, 1, 1)
-        remote_grid.addWidget(btn_right, 1, 2)
-        remote_grid.addWidget(btn_thr_down, 2, 0)
-        remote_grid.addWidget(btn_down, 2, 1)
-        remote_grid.addWidget(btn_yaw_l, 2, 2)
+        self.btn_hover.setObjectName("primary")
+        remote_grid.addWidget(self.btn_thr_up, 0, 0)
+        remote_grid.addWidget(self.btn_up, 0, 1)
+        remote_grid.addWidget(self.btn_yaw_r, 0, 2)
+        remote_grid.addWidget(self.btn_left, 1, 0)
+        remote_grid.addWidget(self.btn_hover, 1, 1)
+        remote_grid.addWidget(self.btn_right, 1, 2)
+        remote_grid.addWidget(self.btn_thr_down, 2, 0)
+        remote_grid.addWidget(self.btn_down, 2, 1)
+        remote_grid.addWidget(self.btn_yaw_l, 2, 2)
         layout.addWidget(remote)
 
-        manual = QGroupBox("连续控制量（滑块调节）")
+        manual = QGroupBox("滑块微调（拖动滑块实时发送控制量）")
         grid = QGridLayout(manual)
         grid.setSpacing(8)
         self.roll = self._slider(0, 255, 128)
@@ -867,54 +895,56 @@ class MainWindow(QMainWindow):
 
         buttons = QGridLayout()
         buttons.setSpacing(6)
-        self.start_control = QPushButton("▶ 启动连续控制")
-        self.start_control.setToolTip("按 50ms 间隔持续发送当前滑块位置的控制指令")
-        self.stop_control = QPushButton("⏹ 停止连续控制")
-        self.stop_control.setToolTip("停止发送连续控制指令")
-        neutral = QPushButton("◎ 悬停/回中")
-        neutral.setToolTip("将所有控制量重置为中间值 128")
-        zero_throttle = QPushButton("⬇ 油门归零")
-        zero_throttle.setToolTip("将油门值设为 0（停止转动）")
+        neutral = QPushButton("◎ 悬停/回中 (Space)")
+        neutral.setToolTip("停止所有方向控制，回到悬停状态")
+        neutral.setMinimumHeight(38)
         takeoff = QPushButton("🛫 起飞")
-        takeoff.setToolTip("连续发送 1 秒起飞指令脉冲")
+        takeoff.setToolTip("发送 1 秒起飞指令，完成后自动保持悬停")
+        takeoff.setMinimumHeight(38)
         land = QPushButton("🛬 降落")
-        land.setToolTip("连续发送 1 秒降落指令脉冲")
+        land.setToolTip("发送 1 秒降落指令，完成后停止")
+        land.setMinimumHeight(38)
         hard_stop = QPushButton("⚠ 急停")
         hard_stop.setObjectName("danger")
         hard_stop.setToolTip("立即发送急停指令——可能导致飞行器直接掉落！")
-        for btn in [self.start_control, self.stop_control, neutral, zero_throttle,
-                     takeoff, land, hard_stop]:
-            btn.setMinimumHeight(38)
-        self.start_control.setObjectName("primary")
-        buttons.addWidget(self.start_control, 0, 0)
-        buttons.addWidget(self.stop_control, 0, 1)
-        buttons.addWidget(neutral, 0, 2)
-        buttons.addWidget(zero_throttle, 0, 3)
-        buttons.addWidget(takeoff, 1, 0)
-        buttons.addWidget(land, 1, 1)
-        buttons.addWidget(hard_stop, 1, 2, 1, 2)
+        hard_stop.setMinimumHeight(38)
+        buttons.addWidget(neutral, 0, 0)
+        buttons.addWidget(takeoff, 0, 1)
+        buttons.addWidget(land, 0, 2)
+        buttons.addWidget(hard_stop, 0, 3)
         layout.addLayout(buttons)
         layout.addStretch(1)
 
+        # --- 滑块信号 ---
         for slider in (self.roll, self.pitch, self.throttle, self.yaw):
             slider.valueChanged.connect(self.update_control)
         self.unlock_check.toggled.connect(self._unlock_changed)
-        self.start_control.clicked.connect(self.start_control_stream)
-        self.stop_control.clicked.connect(self.stop_control_stream)
+
+        # --- 方向按钮：按下持续发送，松开回中 ---
+        self.btn_up.pressed.connect(lambda: self.start_hold("前进", pitch=176))
+        self.btn_up.released.connect(self.stop_hold)
+        self.btn_down.pressed.connect(lambda: self.start_hold("后退", pitch=80))
+        self.btn_down.released.connect(self.stop_hold)
+        self.btn_left.pressed.connect(lambda: self.start_hold("左移", roll=80))
+        self.btn_left.released.connect(self.stop_hold)
+        self.btn_right.pressed.connect(lambda: self.start_hold("右移", roll=176))
+        self.btn_right.released.connect(self.stop_hold)
+        self.btn_yaw_l.pressed.connect(lambda: self.start_hold("左旋", yaw=80))
+        self.btn_yaw_l.released.connect(self.stop_hold)
+        self.btn_yaw_r.pressed.connect(lambda: self.start_hold("右旋", yaw=176))
+        self.btn_yaw_r.released.connect(self.stop_hold)
+        self.btn_thr_up.pressed.connect(lambda: self.start_hold("升高", throttle=192))
+        self.btn_thr_up.released.connect(self.stop_hold)
+        self.btn_thr_down.pressed.connect(lambda: self.start_hold("降低", throttle=64))
+        self.btn_thr_down.released.connect(self.stop_hold)
+        self.btn_hover.pressed.connect(lambda: self.start_hold("悬停", roll=128, pitch=128, throttle=128, yaw=128))
+        self.btn_hover.released.connect(self.stop_hold)
+
+        # --- 动作按钮 ---
         neutral.clicked.connect(self.reset_hover)
-        zero_throttle.clicked.connect(self.zero_throttle)
         takeoff.clicked.connect(self.takeoff)
         land.clicked.connect(self.land)
         hard_stop.clicked.connect(self.hard_stop)
-        btn_up.clicked.connect(lambda: self.nudge("前进", pitch=176))
-        btn_down.clicked.connect(lambda: self.nudge("后退", pitch=80))
-        btn_left.clicked.connect(lambda: self.nudge("左移", roll=80))
-        btn_right.clicked.connect(lambda: self.nudge("右移", roll=176))
-        btn_yaw_l.clicked.connect(lambda: self.nudge("左旋", yaw=80))
-        btn_yaw_r.clicked.connect(lambda: self.nudge("右旋", yaw=176))
-        btn_thr_up.clicked.connect(lambda: self.nudge("升高", throttle=176))
-        btn_thr_down.clicked.connect(lambda: self.nudge("降低", throttle=80))
-        btn_hover.clicked.connect(lambda: self.nudge("悬停", duration=0.25))
         return page
 
     def _developer_tab(self) -> QWidget:
@@ -980,8 +1010,8 @@ class MainWindow(QMainWindow):
             "<li><b>连接无人机 WiFi</b> —— 将电脑连接到 <code>WiFiUFO-3BE7F2</code> 热点。</li>"
             "<li><b>点击 UFO 心跳</b> —— 启动 WiFi UFO UDP 40000 图传和控制通道。</li>"
             "<li><b>选择界面模式</b> —— 使用者界面只显示监控和飞行控制；开发者界面额外显示 CLI。</li>"
-            "<li><b>快捷控制按钮</b> —— 短促发送方向命令（约 0.45 秒后自动回中）。</li>"
-            "<li><b>连续控制</b> -- 点击 “启动连续控制” 后, 以 50ms 间隔持续发送滑块控制量。</li>"
+            "<li><b>持续方向控制</b> —— 按住方向按钮或键盘按键持续发送指令, 松开自动回中悬停。</li>"
+            "<li><b>滑块微调</b> —— 拖动滑块实时调整控制量, 自动以 50ms 间隔持续发送。</li>"
             "<li class='warn'>所有飞行动作默认锁定，必须勾选安全确认后才会发出！</li>"
             "</ol>"
             "<br><b>键盘快捷键：</b><br>"
@@ -1150,11 +1180,10 @@ class MainWindow(QMainWindow):
         self.throttle.setValue(128)
         self.yaw.setValue(128)
         self.update_control()
-
-    @Slot()
-    def zero_throttle(self) -> None:
-        self.throttle.setValue(0)
-        self.update_control()
+        if self.wifi_worker:
+            self.wifi_worker.enqueue(("hold_stop",))
+            self.wifi_worker.enqueue(("stop_stream",))
+        self.command_status.setText("当前命令：悬停")
 
     @Slot(bool)
     def _unlock_changed(self, checked: bool) -> None:
@@ -1190,38 +1219,29 @@ class MainWindow(QMainWindow):
         self.append_log(f"已阻止动作：{action}，原因：安全锁未解锁")
         return False
 
-    @Slot()
-    def start_control_stream(self) -> None:
-        if not self.ensure_unlocked("启动连续控制"):
-            return
-        self.open_udp()
-        if self.wifi_worker:
-            self.wifi_worker.enqueue(("set_control", self.current_control()))
-            self.wifi_worker.enqueue(("start_stream",))
-        self.command_status.setText("当前命令：连续控制中")
-
-    @Slot()
-    def stop_control_stream(self) -> None:
-        if self.wifi_worker:
-            self.wifi_worker.enqueue(("stop_stream",))
-        self.command_status.setText("当前命令：待机")
-
-    def nudge(
+    def start_hold(
         self,
         label: str,
         roll: int = 128,
         pitch: int = 128,
         throttle: int = 128,
         yaw: int = 128,
-        duration: float = 0.45,
     ) -> None:
+        """开始持续发送方向控制（按下按键/鼠标时调用）."""
         if not self.ensure_unlocked(label):
             return
         self.open_udp()
         if self.wifi_worker:
             state = ControlState(roll, pitch, throttle, yaw)
-            self.wifi_worker.enqueue(("nudge", state, label, duration))
-        self.command_status.setText(f"短促控制：{label}")
+            self.wifi_worker.enqueue(("hold_start", state, label))
+        self.command_status.setText(f"持续控制：{label}")
+
+    @Slot()
+    def stop_hold(self) -> None:
+        """停止持续方向控制（松开按键/鼠标时调用）."""
+        if self.wifi_worker:
+            self.wifi_worker.enqueue(("hold_stop",))
+        self.command_status.setText("当前命令：待机")
 
     @Slot()
     def takeoff(self) -> None:
@@ -1231,22 +1251,24 @@ class MainWindow(QMainWindow):
             QMessageBox.question(
                 self,
                 "确认起飞",
-                "即将连续发送 1 秒起飞指令。请确认桨叶安全、机体固定或处于安全飞行区。",
+                "即将发送 1 秒起飞指令，完成后自动保持悬停。\n请确认桨叶安全、机体固定或处于安全飞行区。",
             )
             == QMessageBox.Yes
         ):
             self.open_udp()
             if self.wifi_worker:
-                self.wifi_worker.enqueue(("burst", 1, "起飞", 1.0))
+                self.wifi_worker.enqueue(("burst", 1, "起飞", 1.0, True))
+                # auto_hover=True: 起飞完成后自动保持悬停
 
     @Slot()
     def land(self) -> None:
         if not self.ensure_unlocked("降落"):
             return
-        if QMessageBox.question(self, "确认降落", "即将连续发送 1 秒降落指令。") == QMessageBox.Yes:
+        if QMessageBox.question(self, "确认降落", "即将发送 1 秒降落指令。") == QMessageBox.Yes:
             self.open_udp()
             if self.wifi_worker:
-                self.wifi_worker.enqueue(("burst", 2, "降落", 1.0))
+                self.wifi_worker.enqueue(("hold_stop",))
+                self.wifi_worker.enqueue(("burst", 2, "降落", 1.0, False))
 
     @Slot()
     def hard_stop(self) -> None:
@@ -1375,25 +1397,39 @@ class MainWindow(QMainWindow):
             return
         key = event.key()
         if key in (Qt.Key_W, Qt.Key_Up):
-            self.nudge("前进", pitch=176)
+            self.start_hold("前进", pitch=176)
         elif key in (Qt.Key_S, Qt.Key_Down):
-            self.nudge("后退", pitch=80)
+            self.start_hold("后退", pitch=80)
         elif key == Qt.Key_A:
-            self.nudge("左移", roll=80)
+            self.start_hold("左移", roll=80)
         elif key == Qt.Key_D:
-            self.nudge("右移", roll=176)
+            self.start_hold("右移", roll=176)
         elif key == Qt.Key_Q:
-            self.nudge("左旋", yaw=80)
+            self.start_hold("左旋", yaw=80)
         elif key == Qt.Key_E:
-            self.nudge("右旋", yaw=176)
+            self.start_hold("右旋", yaw=176)
         elif key == Qt.Key_R:
-            self.nudge("升高", throttle=176)
+            self.start_hold("升高", throttle=192)
         elif key == Qt.Key_F:
-            self.nudge("降低", throttle=80)
+            self.start_hold("降低", throttle=64)
         elif key == Qt.Key_Space:
-            self.nudge("悬停", duration=0.25)
+            self.start_hold("悬停", roll=128, pitch=128, throttle=128, yaw=128)
         else:
             super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event: QKeyEvent) -> None:  # noqa: N802
+        if event.isAutoRepeat():
+            return
+        key = event.key()
+        movement_keys = {
+            Qt.Key_W, Qt.Key_Up, Qt.Key_S, Qt.Key_Down,
+            Qt.Key_A, Qt.Key_D, Qt.Key_Q, Qt.Key_E,
+            Qt.Key_R, Qt.Key_F, Qt.Key_Space,
+        }
+        if key in movement_keys:
+            self.stop_hold()
+        else:
+            super().keyReleaseEvent(event)
 
 
 def main() -> int:
