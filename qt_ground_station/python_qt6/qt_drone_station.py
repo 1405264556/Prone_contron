@@ -46,6 +46,7 @@ WIFI_UFO_CONTROL_TEMPLATE = bytearray.fromhex("63 63 0a 00 00 08 00 66 80 80 80 
 VIDEO_FRAGMENT_HEADER_OFFSET = 47
 VIDEO_PAYLOAD_OFFSET = 54
 CONTROL_INTERVAL = 0.05
+IDLE_THROTTLE = 110  # 待机时电机低频旋转的油门值 (0-255)
 
 
 def clamp_byte(value: int) -> int:
@@ -237,11 +238,12 @@ class WifiUfoWorker(QThread):
             self.log_message.emit(f"{self.burst_label}指令脉冲结束")
             self.burst_until = 0.0
             if self.burst_auto_hover:
-                self.hold_state = ControlState(128, 128, 128, 128)
+                # 起飞后进入待机状态：电机低频旋转，等待方向指令
+                self.hold_state = ControlState(128, 128, IDLE_THROTTLE, 128)
                 self.hold_active = True
-                self.hold_label = "自动悬停"
-                self.log_message.emit("起飞完成，自动进入悬停保持")
-                self.status_changed.emit("悬停保持中")
+                self.hold_label = "待机怠速"
+                self.log_message.emit("起飞完成，进入待机怠速状态（电机低频旋转）")
+                self.status_changed.emit("待机中")
             self.next_control_at = now + CONTROL_INTERVAL
             return
 
@@ -899,23 +901,20 @@ class MainWindow(QMainWindow):
 
         buttons = QGridLayout()
         buttons.setSpacing(6)
-        neutral = QPushButton("◎ 悬停/回中 (Space)")
-        neutral.setToolTip("停止所有方向控制，回到悬停状态")
-        neutral.setMinimumHeight(38)
-        takeoff = QPushButton("🛫 起飞")
-        takeoff.setToolTip("发送 1 秒起飞指令，完成后自动保持悬停")
-        takeoff.setMinimumHeight(38)
-        land = QPushButton("🛬 降落")
-        land.setToolTip("发送 1 秒降落指令，完成后停止")
-        land.setMinimumHeight(38)
+        self.arm_btn = QPushButton("解锁待机")
+        self.arm_btn.setToolTip("发送解锁指令使电机进入低频怠速状态，之后方向控制才生效")
+        self.arm_btn.setMinimumHeight(38)
+        self.arm_btn.setObjectName("primary")
+        self.disarm_btn = QPushButton("锁定停机")
+        self.disarm_btn.setToolTip("发送降落/锁定指令，停止所有电机")
+        self.disarm_btn.setMinimumHeight(38)
         hard_stop = QPushButton("⚠ 急停")
         hard_stop.setObjectName("danger")
         hard_stop.setToolTip("立即发送急停指令——可能导致飞行器直接掉落！")
         hard_stop.setMinimumHeight(38)
-        buttons.addWidget(neutral, 0, 0)
-        buttons.addWidget(takeoff, 0, 1)
-        buttons.addWidget(land, 0, 2)
-        buttons.addWidget(hard_stop, 0, 3)
+        buttons.addWidget(self.arm_btn, 0, 0)
+        buttons.addWidget(self.disarm_btn, 0, 1)
+        buttons.addWidget(hard_stop, 0, 2, 1, 2)
         layout.addLayout(buttons)
         layout.addStretch(1)
 
@@ -924,30 +923,30 @@ class MainWindow(QMainWindow):
             slider.valueChanged.connect(self.update_control)
         self.unlock_check.toggled.connect(self._unlock_changed)
 
-        # --- 方向按钮：按下持续发送，松开回中 ---
+        # --- 方向按钮：按下=基准叠加，松开=回到待机怠速 ---
         self.btn_up.pressed.connect(lambda: self.start_hold("前进", pitch=176))
-        self.btn_up.released.connect(self.stop_hold)
+        self.btn_up.released.connect(self.stop_hold_to_idle)
         self.btn_down.pressed.connect(lambda: self.start_hold("后退", pitch=80))
-        self.btn_down.released.connect(self.stop_hold)
+        self.btn_down.released.connect(self.stop_hold_to_idle)
         self.btn_left.pressed.connect(lambda: self.start_hold("左移", roll=80))
-        self.btn_left.released.connect(self.stop_hold)
+        self.btn_left.released.connect(self.stop_hold_to_idle)
         self.btn_right.pressed.connect(lambda: self.start_hold("右移", roll=176))
-        self.btn_right.released.connect(self.stop_hold)
+        self.btn_right.released.connect(self.stop_hold_to_idle)
         self.btn_yaw_l.pressed.connect(lambda: self.start_hold("左旋", yaw=80))
-        self.btn_yaw_l.released.connect(self.stop_hold)
+        self.btn_yaw_l.released.connect(self.stop_hold_to_idle)
         self.btn_yaw_r.pressed.connect(lambda: self.start_hold("右旋", yaw=176))
-        self.btn_yaw_r.released.connect(self.stop_hold)
+        self.btn_yaw_r.released.connect(self.stop_hold_to_idle)
         self.btn_thr_up.pressed.connect(lambda: self.start_hold("升高", throttle=192))
-        self.btn_thr_up.released.connect(self.stop_hold)
-        self.btn_thr_down.pressed.connect(lambda: self.start_hold("降低", throttle=64))
-        self.btn_thr_down.released.connect(self.stop_hold)
-        self.btn_hover.pressed.connect(lambda: self.start_hold("悬停", roll=128, pitch=128, throttle=128, yaw=128))
-        self.btn_hover.released.connect(self.stop_hold)
+        self.btn_thr_up.released.connect(self.stop_hold_to_idle)
+        self.btn_thr_down.pressed.connect(lambda: self.start_hold("降低", throttle=80))
+        self.btn_thr_down.released.connect(self.stop_hold_to_idle)
+        self.btn_hover.pressed.connect(lambda: self.start_hold("悬停", roll=128, pitch=128, throttle=IDLE_THROTTLE,
+                                                               yaw=128))
+        self.btn_hover.released.connect(self.stop_hold_to_idle)
 
         # --- 动作按钮 ---
-        neutral.clicked.connect(self.reset_hover)
-        takeoff.clicked.connect(self.takeoff)
-        land.clicked.connect(self.land)
+        self.arm_btn.clicked.connect(self.arm_idle)
+        self.disarm_btn.clicked.connect(self.disarm)
         hard_stop.clicked.connect(self.hard_stop)
         return page
 
@@ -1181,13 +1180,13 @@ class MainWindow(QMainWindow):
     def reset_hover(self) -> None:
         self.roll.setValue(128)
         self.pitch.setValue(128)
-        self.throttle.setValue(128)
+        self.throttle.setValue(IDLE_THROTTLE)
         self.yaw.setValue(128)
         self.update_control()
         if self.wifi_worker:
             self.wifi_worker.enqueue(("hold_stop",))
             self.wifi_worker.enqueue(("stop_stream",))
-        self.command_status.setText("当前命令：悬停")
+        self.command_status.setText("当前命令：待机")
 
     @Slot(bool)
     def _unlock_changed(self, checked: bool) -> None:
@@ -1228,10 +1227,11 @@ class MainWindow(QMainWindow):
         label: str,
         roll: int = 128,
         pitch: int = 128,
-        throttle: int = 128,
+        throttle: int = IDLE_THROTTLE,
         yaw: int = 128,
     ) -> None:
-        """开始持续发送方向控制（按下按键/鼠标时调用）."""
+        """开始持续发送方向控制（按下按键/鼠标时调用）.
+        默认油门为 IDLE_THROTTLE 待机怠速，保证电机持续低频旋转。"""
         if not self.ensure_unlocked(label):
             return
         self.open_udp()
@@ -1242,37 +1242,53 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def stop_hold(self) -> None:
-        """停止持续方向控制（松开按键/鼠标时调用）."""
+        """完全停止控制（发送回中包后不再发送）."""
         if self.wifi_worker:
             self.wifi_worker.enqueue(("hold_stop",))
-        self.command_status.setText("当前命令：待机")
+        self.command_status.setText("当前命令：已停机")
 
     @Slot()
-    def takeoff(self) -> None:
-        if not self.ensure_unlocked("起飞"):
+    def stop_hold_to_idle(self) -> None:
+        """松开方向键后回到待机怠速状态（而非完全停机）."""
+        if self.wifi_worker:
+            state = ControlState(128, 128, IDLE_THROTTLE, 128)
+            self.wifi_worker.enqueue(("hold_start", state, "待机怠速"))
+        self.command_status.setText("当前命令：待机怠速")
+
+    @Slot()
+    def arm_idle(self) -> None:
+        """解锁并进入待机状态：发送起飞脉冲后自动维持电机低频旋转."""
+        if not self.ensure_unlocked("解锁待机"):
             return
         if (
             QMessageBox.question(
                 self,
-                "确认起飞",
-                "即将发送 1 秒起飞指令，完成后自动保持悬停。\n请确认桨叶安全、机体固定或处于安全飞行区。",
+                "确认解锁",
+                "即将发送解锁指令，电机将进入低频怠速旋转状态。\n请确认桨叶安全、机体固定或处于安全飞行区。",
             )
             == QMessageBox.Yes
         ):
             self.open_udp()
             if self.wifi_worker:
-                self.wifi_worker.enqueue(("burst", 1, "起飞", 1.0, True))
-                # auto_hover=True: 起飞完成后自动保持悬停
+                # 先停掉可能残留的 hold/stream
+                self.wifi_worker.enqueue(("hold_stop",))
+                self.wifi_worker.enqueue(("stop_stream",))
+                # 发送起飞脉冲 → 自动进入待机怠速
+                self.wifi_worker.enqueue(("burst", 1, "解锁", 1.0, True))
+                self.command_status.setText("当前命令：解锁中...")
 
     @Slot()
-    def land(self) -> None:
-        if not self.ensure_unlocked("降落"):
+    def disarm(self) -> None:
+        """锁定停机：发送降落指令停止所有电机."""
+        if not self.ensure_unlocked("锁定停机"):
             return
-        if QMessageBox.question(self, "确认降落", "即将发送 1 秒降落指令。") == QMessageBox.Yes:
+        if QMessageBox.question(self, "确认锁定", "即将发送降落/锁定指令，电机将停止。") == QMessageBox.Yes:
             self.open_udp()
             if self.wifi_worker:
                 self.wifi_worker.enqueue(("hold_stop",))
-                self.wifi_worker.enqueue(("burst", 2, "降落", 1.0, False))
+                self.wifi_worker.enqueue(("stop_stream",))
+                self.wifi_worker.enqueue(("burst", 2, "锁定", 1.0, False))
+                self.command_status.setText("当前命令：已锁定")
 
     @Slot()
     def hard_stop(self) -> None:
@@ -1419,7 +1435,7 @@ class MainWindow(QMainWindow):
         elif key == Qt.Key_F:
             self.start_hold("降低", throttle=64)
         elif key == Qt.Key_Space:
-            self.start_hold("悬停", roll=128, pitch=128, throttle=128, yaw=128)
+            self.start_hold("悬停")
         else:
             super().keyPressEvent(event)
 
@@ -1433,7 +1449,7 @@ class MainWindow(QMainWindow):
             Qt.Key_R, Qt.Key_F, Qt.Key_Space,
         }
         if key in movement_keys:
-            self.stop_hold()
+            self.stop_hold_to_idle()
         else:
             super().keyReleaseEvent(event)
 
