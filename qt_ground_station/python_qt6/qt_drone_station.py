@@ -109,7 +109,7 @@ class WifiUfoWorker(QThread):
         self.hold_active = False
         self.hold_state = ControlState()
         self.hold_label = ""
-        self._pending_center = False
+        self.last_heartbeat_at = 0.0
 
         self.frame_buffer = bytearray()
         self.frame_open = False
@@ -167,6 +167,7 @@ class WifiUfoWorker(QThread):
                 return
             if name == "heartbeat":
                 self._send(sock, WIFI_UFO_HEARTBEAT)
+                self.last_heartbeat_at = time.monotonic()
                 self.log_message.emit(f"TX {self.host}:{self.remote_port} WiFi UFO 心跳 {WIFI_UFO_HEARTBEAT.hex()}")
             elif name == "set_control":
                 self.control = command[1].clamped()
@@ -180,12 +181,17 @@ class WifiUfoWorker(QThread):
                 self.log_message.emit("控制流已停止")
                 self.status_changed.emit("UDP 已连接")
             elif name == "burst":
+                self._send(sock, WIFI_UFO_HEARTBEAT)
+                self.last_heartbeat_at = time.monotonic()
                 self.burst_mode = int(command[1])
                 self.burst_label = str(command[2])
                 self.burst_until = time.monotonic() + float(command[3])
                 self.burst_auto_hover = len(command) > 4 and bool(command[4])
+                self.next_control_at = 0.0
                 self.log_message.emit(f"开始发送{self.burst_label}指令脉冲 {command[3]:.1f} 秒")
             elif name == "hold_start":
+                self._send(sock, WIFI_UFO_HEARTBEAT)
+                self.last_heartbeat_at = time.monotonic()
                 self.hold_state = command[1].clamped()
                 self.hold_label = str(command[2]) if len(command) > 2 else ""
                 self.hold_active = True
@@ -194,8 +200,11 @@ class WifiUfoWorker(QThread):
                 self.status_changed.emit("持续控制中")
             elif name == "hold_stop":
                 self.hold_active = False
-                self._pending_center = True
+                # 立即发送回中包，不延迟
+                self._send_control(sock, ControlState(), 0, "回中")
+                self.next_control_at = time.monotonic() + CONTROL_INTERVAL
                 self.log_message.emit(f"持续控制停止：{self.hold_label}")
+                self.status_changed.emit("UDP 已连接")
 
     def _read_socket(self, sock: socket.socket) -> None:
         while True:
@@ -209,6 +218,12 @@ class WifiUfoWorker(QThread):
 
     def _tick_control(self, sock: socket.socket) -> None:
         now = time.monotonic()
+
+        # --- 持续心跳：每秒发送一次，维持无人机连接 ---
+        if now - self.last_heartbeat_at >= 1.0:
+            self._send(sock, WIFI_UFO_HEARTBEAT)
+            self.last_heartbeat_at = now
+
         if now < self.next_control_at:
             return
 
@@ -222,7 +237,6 @@ class WifiUfoWorker(QThread):
             self.log_message.emit(f"{self.burst_label}指令脉冲结束")
             self.burst_until = 0.0
             if self.burst_auto_hover:
-                # 起飞后自动进入悬停保持
                 self.hold_state = ControlState(128, 128, 128, 128)
                 self.hold_active = True
                 self.hold_label = "自动悬停"
@@ -231,23 +245,13 @@ class WifiUfoWorker(QThread):
             self.next_control_at = now + CONTROL_INTERVAL
             return
 
-        # --- 优先级 2: 回中补偿 (松开按键时发送一次回中) ---
-        if self._pending_center:
-            self._send_control(sock, ControlState(), 0, "回中")
-            self._pending_center = False
-            self.next_control_at = now + CONTROL_INTERVAL
-            self.status_changed.emit("UDP 已连接")
-            if not self.hold_active and not self.control_stream:
-                return
-            # 如果还有 hold 或 stream 活跃，继续往下走
-
-        # --- 优先级 3: 持续按键保持 ---
+        # --- 优先级 2: 持续按键保持 ---
         if self.hold_active:
             self._send_control(sock, self.hold_state, 0, self.hold_label)
             self.next_control_at = now + CONTROL_INTERVAL
             return
 
-        # --- 优先级 4: 滑块连续控制流 ---
+        # --- 优先级 3: 滑块连续控制流 ---
         if self.control_stream:
             self._send_control(sock, self.control, 0, "手动控制")
             self.next_control_at = now + CONTROL_INTERVAL
@@ -1286,6 +1290,8 @@ class MainWindow(QMainWindow):
         ):
             self.open_udp()
             if self.wifi_worker:
+                self.wifi_worker.enqueue(("hold_stop",))
+                self.wifi_worker.enqueue(("stop_stream",))
                 self.wifi_worker.enqueue(("burst", 4, "急停", 1.0))
 
     @Slot(dict)
