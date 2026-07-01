@@ -45,7 +45,7 @@ WIFI_UFO_HEARTBEAT = bytes.fromhex("63 63 01 00 00 00 00")
 WIFI_UFO_CONTROL_TEMPLATE = bytearray.fromhex("63 63 0a 00 00 08 00 66 80 80 80 80 00 00 99")
 VIDEO_FRAGMENT_HEADER_OFFSET = 47
 VIDEO_PAYLOAD_OFFSET = 54
-CONTROL_INTERVAL = 0.05
+CONTROL_INTERVAL = 0.02  # 50Hz, 标准 RC 遥控频率
 IDLE_THROTTLE = 110  # 待机时电机低频旋转的油门值 (0-255)
 
 
@@ -105,6 +105,7 @@ class WifiUfoWorker(QThread):
         self.next_control_at = 0.0
         self.burst_until = 0.0
         self.burst_mode = 0
+        self.burst_state = ControlState()
         self.burst_label = ""
         self.burst_auto_hover = False
         self.hold_active = False
@@ -184,12 +185,13 @@ class WifiUfoWorker(QThread):
             elif name == "burst":
                 self._send(sock, WIFI_UFO_HEARTBEAT)
                 self.last_heartbeat_at = time.monotonic()
-                self.burst_mode = int(command[1])
-                self.burst_label = str(command[2])
-                self.burst_until = time.monotonic() + float(command[3])
-                self.burst_auto_hover = len(command) > 4 and bool(command[4])
+                self.burst_state = command[1].clamped()
+                self.burst_mode = int(command[2])
+                self.burst_label = str(command[3])
+                self.burst_until = time.monotonic() + float(command[4])
+                self.burst_auto_hover = len(command) > 5 and bool(command[5])
                 self.next_control_at = 0.0
-                self.log_message.emit(f"开始发送{self.burst_label}指令脉冲 {command[3]:.1f} 秒")
+                self.log_message.emit(f"开始发送{self.burst_label}指令脉冲 {command[4]:.1f} 秒")
             elif name == "hold_start":
                 self._send(sock, WIFI_UFO_HEARTBEAT)
                 self.last_heartbeat_at = time.monotonic()
@@ -231,7 +233,7 @@ class WifiUfoWorker(QThread):
 
         # --- 优先级 1: 突发指令 (起飞/降落/急停) ---
         if self.burst_until > now:
-            self._send_control(sock, ControlState(), self.burst_mode, self.burst_label)
+            self._send_control(sock, self.burst_state, self.burst_mode, self.burst_label)
             self.next_control_at = now + CONTROL_INTERVAL
             sent_control = True
 
@@ -1270,7 +1272,9 @@ class MainWindow(QMainWindow):
             QMessageBox.question(
                 self,
                 "确认解锁",
-                "即将发送解锁指令，电机将进入低频怠速旋转状态。\n请确认桨叶安全、机体固定或处于安全飞行区。",
+                "即将发送 Cleanflight 解锁序列（油门最低+偏航最大，持续4秒）。\n"
+                "解锁成功后电机将进入低频怠速旋转。\n"
+                "请确认桨叶安全、机体固定或处于安全飞行区。",
             )
             == QMessageBox.Yes
         ):
@@ -1279,8 +1283,9 @@ class MainWindow(QMainWindow):
                 # 先发心跳预热连接，确保无人机已就绪
                 self.wifi_worker.enqueue(("heartbeat",))
                 self.wifi_worker.enqueue(("heartbeat",))
-                # 发送 2 秒起飞脉冲 → 自动进入待机怠速
-                self.wifi_worker.enqueue(("burst", 1, "解锁", 2.0, True))
+                # Cleanflight 解锁序列: 油门最低(0) + 偏航最大(255) 持续 4 秒
+                arm_state = ControlState(128, 128, 0, 255)
+                self.wifi_worker.enqueue(("burst", arm_state, 0, "解锁", 4.0, True))
                 self.command_status.setText("当前命令：解锁中...")
 
     @Slot()
@@ -1293,7 +1298,7 @@ class MainWindow(QMainWindow):
             if self.wifi_worker:
                 self.wifi_worker.enqueue(("hold_stop",))
                 self.wifi_worker.enqueue(("stop_stream",))
-                self.wifi_worker.enqueue(("burst", 2, "锁定", 1.0, False))
+                self.wifi_worker.enqueue(("burst", ControlState(), 2, "锁定", 1.0, False))
                 self.command_status.setText("当前命令：已锁定")
 
     @Slot()
@@ -1314,7 +1319,7 @@ class MainWindow(QMainWindow):
             if self.wifi_worker:
                 self.wifi_worker.enqueue(("hold_stop",))
                 self.wifi_worker.enqueue(("stop_stream",))
-                self.wifi_worker.enqueue(("burst", 4, "急停", 1.0))
+                self.wifi_worker.enqueue(("burst", ControlState(), 4, "急停", 1.0))
 
     @Slot(dict)
     def update_telemetry(self, values: dict) -> None:
