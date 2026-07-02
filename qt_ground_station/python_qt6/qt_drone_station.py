@@ -434,11 +434,14 @@ class WifiUfoWorker(QThread):
                     "包类型": str(packet_type),
                     "长度": str(len(data)),
                     "预览": data[:80].hex(" "),
+                    "WiFi监控": "WiFiUFO 信息/图传包，未发现 IMU 姿态字段",
                 }
             )
             self.log_message.emit(f"收到 WiFi UFO 信息包：SSID={ssid} len={len(data)}")
             return
         if packet_type == 3:
+            if self.video_packets == 0:
+                self.info_received.emit({"WiFi监控": "收到图传包；姿态/IMU 仍需串口 MSP"})
             self._handle_video_packet(data)
             return
         self.info_received.emit(
@@ -858,6 +861,12 @@ class CleanflightSerialClient(QThread):
         i2c = re.search(r"I2C Errors:\s*(\d+)", text)
         if i2c:
             data["I2C 错误"] = i2c.group(1)
+        features = re.search(r"Enabled:\s*([^\r\n#]+)", text)
+        if features:
+            data["接收机功能"] = " ".join(features.group(1).split())
+        serialrx = re.search(r"serialrx_provider\s*=\s*([^\s\r\n]+)", text)
+        if serialrx:
+            data["serialrx_provider"] = serialrx.group(1).strip()
         if data:
             self.telemetry.emit(data)
 
@@ -944,6 +953,8 @@ class MainWindow(QMainWindow):
         self.serial_burst_state = ControlState(128, 128, WIRED_IDLE_THROTTLE, 128)
         self.serial_burst_label = ""
         self.serial_burst_auto_idle = False
+        self.fc_features: set[str] = set()
+        self.serialrx_provider = ""
         self.log_path = QT_LOG_DIR / f"qt6_ground_station_{QDateTime.currentDateTime().toString('yyyyMMdd_HHmmss')}.log"
         self.log_file = self.log_path.open("a", encoding="utf-8")
         self._build_ui()
@@ -1125,13 +1136,13 @@ class MainWindow(QMainWindow):
         self.connection_hint = card_label("连接策略：无线/有线遥测默认开启", "#eff6ff", "#1e40af")
         self.control_transport_combo = QComboBox()
         self.control_transport_combo.addItems([
-            "自动：有线优先 + WiFi 图传",
-            "无线 UDP 控制/图传",
-            "有线 MSP RC 控制",
-            "混合：有线控电机 + WiFi 图传",
+            "WiFi模式：UDP控制/图传（无真实IMU）",
+            "有线调试：MSP/CLI传感器",
+            "有线控制：需RX_MSP接收机",
+            "混合模式：仅双链路硬件",
         ])
-        self.control_transport_combo.setToolTip("普通串口无法承载摄像图传；需要图像时请使用 WiFi UDP 或混合模式")
-        self.control_transport_status = card_label("控制：自动，有线优先；图传：WiFi UDP", "#f8fafc", "#334155")
+        self.control_transport_combo.setToolTip("这台硬件插有线时 WiFi 可能不启动；普通串口也不能传摄像图像")
+        self.control_transport_status = card_label("WiFi模式：控制/图传可用，IMU需串口", "#f8fafc", "#334155")
         overview_layout.addWidget(QLabel("界面模式"), 0, 0)
         overview_layout.addWidget(self.mode_combo, 0, 1)
         overview_layout.addWidget(QLabel("协议"), 0, 2)
@@ -1614,6 +1625,19 @@ class MainWindow(QMainWindow):
         stream_grid.setColumnStretch(0, 1)
         layout.addWidget(sensor_stream)
 
+        receiver = QGroupBox("接收机模式（有线控制需要 RX_MSP）")
+        receiver_grid = QGridLayout(receiver)
+        self.receiver_mode_status = card_label("接收机：未检测", "#fff7ed", "#c2410c")
+        detect_rx = QPushButton("检测接收机")
+        enable_msp_rx = QPushButton("启用有线 RX_MSP")
+        restore_ppm_rx = QPushButton("恢复 WiFi/RX_PPM")
+        receiver_grid.addWidget(self.receiver_mode_status, 0, 0, 1, 3)
+        receiver_grid.addWidget(detect_rx, 1, 0)
+        receiver_grid.addWidget(enable_msp_rx, 1, 1)
+        receiver_grid.addWidget(restore_ppm_rx, 1, 2)
+        receiver_grid.setColumnStretch(0, 1)
+        layout.addWidget(receiver)
+
         params = QGroupBox("算法参数调试")
         params_layout = QGridLayout(params)
         self.pid_axis_combo = QComboBox()
@@ -1703,6 +1727,9 @@ class MainWindow(QMainWindow):
         stop_wired.clicked.connect(self.stop_wired_sensor_stream)
         start_wireless.clicked.connect(self.start_wireless_sensor_stream)
         stop_wireless.clicked.connect(self.stop_wireless_sensor_stream)
+        detect_rx.clicked.connect(self.detect_receiver_mode)
+        enable_msp_rx.clicked.connect(self.enable_wired_rx_msp)
+        restore_ppm_rx.clicked.connect(self.restore_wifi_rx_ppm)
         make_pid.clicked.connect(self.generate_pid_cli)
         get_param.clicked.connect(self.get_parameter_filter)
         diff_params.clicked.connect(self.read_diff_parameters)
@@ -1823,14 +1850,15 @@ class MainWindow(QMainWindow):
     @Slot()
     def update_control_transport_status(self) -> None:
         text = self.control_transport_combo.currentText() if hasattr(self, "control_transport_combo") else "自动"
-        if "有线 MSP RC" in text:
-            status = "控制：有线 MSP RC；图传：需 WiFi UDP"
+        if text.startswith("有线控制"):
+            rx = "RX_MSP已启用" if "RX_MSP" in self.fc_features else "等待RX_MSP"
+            status = f"有线控制：{rx}；无串口图传"
+        elif text.startswith("有线调试"):
+            status = "有线调试：传感器/CLI；不发送电机控制"
         elif "混合" in text:
-            status = "控制：有线 MSP RC；图传：WiFi UDP"
-        elif "无线" in text:
-            status = "控制/图传：WiFi UDP"
+            status = "混合：仅双链路硬件；本机可能不适用"
         else:
-            status = "控制：自动，有线优先；图传：WiFi UDP"
+            status = "WiFi模式：控制/图传；通常无真实IMU"
         if hasattr(self, "control_transport_status"):
             self.control_transport_status.setText(status)
         if hasattr(self, "control_link_card"):
@@ -1842,28 +1870,24 @@ class MainWindow(QMainWindow):
 
     def use_wired_control(self) -> bool:
         text = self.control_transport_combo.currentText() if hasattr(self, "control_transport_combo") else "自动"
-        if text.startswith("自动"):
-            return self.serial_link_ready()
-        if "无线 UDP" in text:
-            return False
-        if "有线" in text or "混合" in text:
+        if text.startswith("有线控制") or text.startswith("混合"):
             return True
         return False
 
     def use_wifi_control(self) -> bool:
         text = self.control_transport_combo.currentText() if hasattr(self, "control_transport_combo") else "自动"
-        if text.startswith("自动"):
-            return not self.serial_link_ready()
-        if "无线 UDP" in text:
+        if text.startswith("WiFi"):
             return True
-        if "有线" in text or "混合" in text:
+        if text.startswith("有线"):
             return False
-        return True
+        return "混合" not in text
 
     def should_keep_wifi_video(self) -> bool:
         text = self.control_transport_combo.currentText() if hasattr(self, "control_transport_combo") else "自动"
         wireless_enabled = self.wireless_sensor_check.isChecked() if hasattr(self, "wireless_sensor_check") else True
-        return wireless_enabled or "图传" in text or "混合" in text
+        if text.startswith("有线"):
+            return False
+        return wireless_enabled or "WiFi" in text or "混合" in text
 
     def prepare_video_link(self) -> None:
         if self.should_keep_wifi_video():
@@ -1876,9 +1900,21 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "有线控制未连接", f"“{action}” 选择了有线 MSP RC 控制，请先连接飞控串口。")
                 self.append_log(f"已阻止动作：{action}，原因：有线 MSP RC 未连接")
                 return False
+            if self.fc_features and "RX_MSP" not in self.fc_features:
+                QMessageBox.information(
+                    self,
+                    "飞控未启用 RX_MSP",
+                    "当前飞控接收机功能不是 RX_MSP，因此会忽略 MSP_SET_RAW_RC 控制。\n"
+                    "请到“算法/调参/烧录”页先点击“启用有线 RX_MSP”，保存重启后再测试。\n"
+                    "需要恢复 WiFi/原接收机时点击“恢复 WiFi/RX_PPM”。",
+                )
+                self.append_log("已阻止有线控制：飞控未启用 RX_MSP")
+                return False
             if self.serial_worker:
                 self.serial_worker.enqueue_line("exit")
-            self.prepare_video_link()
+            text = self.control_transport_combo.currentText() if hasattr(self, "control_transport_combo") else ""
+            if "混合" in text:
+                self.prepare_video_link()
             return True
         self.open_udp()
         return True
@@ -1922,6 +1958,8 @@ class MainWindow(QMainWindow):
         self.wifi_worker = WifiUfoWorker(self.ip_edit.text().strip(), self.remote_udp.value(), self.local_udp.value())
         self._connect_worker(self.wifi_worker)
         self.wifi_worker.start()
+        self.set_metric("WiFi监控", "等待 UDP 信息/图传包；WiFiUFO 通常不回传 IMU")
+        self._set_sensor_value("imu", "WiFi无IMU")
         if hasattr(self, "wireless_sensor_check") and self.wireless_sensor_check.isChecked():
             self.start_wireless_sensor_stream()
 
@@ -2161,6 +2199,54 @@ class MainWindow(QMainWindow):
         for line in ("#", "version", "status", "dump"):
             self.serial_worker.enqueue_line(line)
         self.serial_diag_status.setText("诊断：已请求 version/status/dump")
+
+    @Slot()
+    def detect_receiver_mode(self) -> None:
+        if not self.serial_worker:
+            self.append_log("串口未连接，无法检测接收机模式")
+            return
+        for line in ("#", "feature", "get serialrx_provider", "status", "exit"):
+            self.serial_worker.enqueue_line(line)
+        self.serial_diag_status.setText("诊断：已请求接收机模式")
+
+    @Slot()
+    def enable_wired_rx_msp(self) -> None:
+        if not self.serial_worker:
+            self.append_log("串口未连接，无法启用 RX_MSP")
+            return
+        reply = QMessageBox.warning(
+            self,
+            "确认启用有线 RX_MSP",
+            "这会写入飞控配置：关闭 RX_PPM、启用 RX_MSP 并 save 重启。\n"
+            "启用后 WiFi/原 PPM 接收机控制可能失效，直到恢复 RX_PPM。\n"
+            "请确认已拆桨/固定机体。是否继续？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        for line in ("#", "feature -RX_PPM", "feature RX_MSP", "feature", "save"):
+            self.serial_worker.enqueue_line(line)
+        self.append_log("已发送：启用 RX_MSP 并保存重启")
+
+    @Slot()
+    def restore_wifi_rx_ppm(self) -> None:
+        if not self.serial_worker:
+            self.append_log("串口未连接，无法恢复 RX_PPM")
+            return
+        reply = QMessageBox.warning(
+            self,
+            "确认恢复 WiFi/RX_PPM",
+            "这会写入飞控配置：关闭 RX_MSP、启用 RX_PPM 并 save 重启。\n"
+            "用于恢复 WiFi 模块/原接收机控制。请确认已拆桨/固定机体。是否继续？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        for line in ("#", "feature -RX_MSP", "feature RX_PPM", "feature", "save"):
+            self.serial_worker.enqueue_line(line)
+        self.append_log("已发送：恢复 RX_PPM 并保存重启")
 
     @Slot()
     def get_parameter_filter(self) -> None:
@@ -2749,6 +2835,15 @@ class MainWindow(QMainWindow):
     def update_telemetry(self, values: dict) -> None:
         for key, value in values.items():
             self.set_metric(str(key), str(value))
+        if "接收机功能" in values:
+            self.fc_features = set(str(values["接收机功能"]).split())
+            mode = "RX_MSP" if "RX_MSP" in self.fc_features else ("RX_PPM" if "RX_PPM" in self.fc_features else "未知")
+            if hasattr(self, "receiver_mode_status"):
+                self.receiver_mode_status.setText(f"接收机：{mode} / {values['接收机功能']}")
+            self.update_control_transport_status()
+        if "serialrx_provider" in values:
+            self.serialrx_provider = str(values["serialrx_provider"])
+            self.set_metric("serialrx_provider", self.serialrx_provider)
         self.update_sensor_monitor(values)
         if "飞控固件" in values and self.serial_worker:
             port_info = f"{self.serial_worker.port_label} / {values['飞控固件']}"
