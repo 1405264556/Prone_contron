@@ -835,11 +835,72 @@ class CleanflightSerialClient(QThread):
             self.telemetry.emit(data)
 
 
+class SerialProbeWorker(QThread):
+    progress = Signal(str)
+    found = Signal(int, str)
+    probe_finished = Signal(bool)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.port_label = ""
+        self.baud_values: list[int] = []
+        self.dtr = False
+        self.rts = False
+        self.stop_event = threading.Event()
+
+    def configure(self, port_label: str, baud_values: list[int], dtr: bool = False, rts: bool = False) -> None:
+        self.port_label = port_label
+        self.baud_values = baud_values
+        self.dtr = dtr
+        self.rts = rts
+        self.stop_event.clear()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+    def run(self) -> None:
+        port = self.port_label.split(" - ", 1)[0].strip()
+        for baud in self.baud_values:
+            if self.stop_event.is_set():
+                self.probe_finished.emit(False)
+                return
+            serial = QSerialPort()
+            serial.setPortName(port)
+            serial.setBaudRate(baud)
+            serial.setDataBits(QSerialPort.Data8)
+            serial.setParity(QSerialPort.NoParity)
+            serial.setStopBits(QSerialPort.OneStop)
+            serial.setFlowControl(QSerialPort.NoFlowControl)
+            if not serial.open(QSerialPort.ReadWrite):
+                self.progress.emit(f"探测 {baud} 失败：{serial.errorString()}")
+                continue
+            serial.setDataTerminalReady(self.dtr)
+            serial.setRequestToSend(self.rts)
+            serial.write(b"\r\n#\r\nversion\r\nstatus\r\n")
+            serial.waitForBytesWritten(120)
+            response = bytearray()
+            deadline = time.monotonic() + 0.45
+            while time.monotonic() < deadline and not self.stop_event.is_set():
+                if serial.waitForReadyRead(50):
+                    response.extend(bytes(serial.readAll()))
+            serial.write(b"exit\r\n")
+            serial.waitForBytesWritten(100)
+            serial.close()
+            if response:
+                text = bytes(response).decode("utf-8", errors="replace").strip()
+                self.found.emit(baud, text[:500] if text else bytes(response).hex(" "))
+                self.probe_finished.emit(True)
+                return
+            self.progress.emit(f"波特率 {baud} 无返回")
+        self.probe_finished.emit(False)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.wifi_worker: WifiUfoWorker | None = None
         self.serial_worker: CleanflightSerialClient | None = None
+        self.serial_probe_worker: SerialProbeWorker | None = None
         self.metric_rows: dict[str, int] = {}
         self.sensor_cards: dict[str, QLabel] = {}
         self.sensor_titles: dict[str, str] = {}
@@ -854,6 +915,9 @@ class MainWindow(QMainWindow):
         self.msp_timer = QTimer(self)
         self.msp_timer.setInterval(200)
         self.msp_timer.timeout.connect(self.poll_msp_attitude)
+        self.wireless_telemetry_timer = QTimer(self)
+        self.wireless_telemetry_timer.setInterval(700)
+        self.wireless_telemetry_timer.timeout.connect(self.poll_wireless_telemetry)
         self.refresh_ports()
         self.apply_profile()
         self.reset_hover()
@@ -864,6 +928,11 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: N802
         if hasattr(self, "msp_timer"):
             self.msp_timer.stop()
+        if hasattr(self, "wireless_telemetry_timer"):
+            self.wireless_telemetry_timer.stop()
+        if self.serial_probe_worker:
+            self.serial_probe_worker.stop()
+            self.serial_probe_worker.wait(300)
         self.close_udp()
         self.close_serial()
         self.log_file.close()
@@ -895,11 +964,11 @@ class MainWindow(QMainWindow):
             QPushButton#danger:hover { background:#fee2e2; border-color:#ef4444; }
             QPushButton#primary { background:#2563eb; border-color:#2563eb; color:white; }
             QPushButton#primary:hover { background:#1d4ed8; }
-            QLineEdit, QSpinBox, QComboBox {
+            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
                 background:white; border:1px solid #c4cdd9; border-radius:5px;
                 padding:5px; color:#334155;
             }
-            QLineEdit:focus, QSpinBox:focus, QComboBox:focus { border-color:#3b82f6; }
+            QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus { border-color:#3b82f6; }
             QSlider::groove:horizontal { border-radius:3px; height:6px; background:#dde3ed; }
             QSlider::handle:horizontal {
                 background:#2563eb; border-radius:8px; width:16px;
@@ -937,14 +1006,14 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self._monitor_tab())
         splitter.addWidget(self._center_panel())
         splitter.addWidget(self._control_panel())
-        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 3)
         splitter.setStretchFactor(2, 1)
-        splitter.setSizes([330, 820, 390])
+        splitter.setSizes([470, 760, 350])
         root.addWidget(splitter, 1)
 
         self.dev_tabs = QTabWidget()
-        self.dev_tabs.setMaximumHeight(320)
+        self.dev_tabs.setMaximumHeight(420)
         self.dev_console_index = self.dev_tabs.addTab(self._developer_tab(), "开发者 CLI")
         self.algorithm_index = self.dev_tabs.addTab(self._algorithm_tab(), "算法/调参/烧录")
         self.safety_index = self.dev_tabs.addTab(self._safety_tab(), "安全/说明")
@@ -997,94 +1066,121 @@ class MainWindow(QMainWindow):
         )
         help_menu.addAction(about_action)
 
-    def _top_panel(self) -> QGroupBox:
-        group = QGroupBox("连接配置")
-        layout = QGridLayout(group)
-        layout.setVerticalSpacing(6)
-        layout.setHorizontalSpacing(8)
+    def _top_panel(self) -> QTabWidget:
+        tabs = QTabWidget()
+        tabs.setDocumentMode(True)
+        tabs.setMaximumHeight(165)
 
-        # --- Row 0: 界面模式 + 协议 ---
-        layout.addWidget(QLabel("界面模式"), 0, 0)
+        overview = QWidget()
+        overview_layout = QGridLayout(overview)
+        overview_layout.setVerticalSpacing(8)
+        overview_layout.setHorizontalSpacing(10)
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["使用者界面", "开发者界面"])
         self.mode_combo.setToolTip("使用者界面隐藏底部开发者区，开发者界面显示 CLI 与安全说明")
-        layout.addWidget(self.mode_combo, 0, 1)
-
-        layout.addWidget(QLabel("协议"), 0, 2)
         self.profile_combo = QComboBox()
         self.profile_combo.addItems(["WiFi UFO UDP", "Tello 兼容 UDP", "仅串口 Cleanflight"])
         self.profile_combo.setToolTip("选择通信协议，自动配置默认端口")
-        layout.addWidget(self.profile_combo, 0, 3)
+        self.connection_hint = card_label("连接策略：无线/有线遥测默认开启", "#eff6ff", "#1e40af")
+        overview_layout.addWidget(QLabel("界面模式"), 0, 0)
+        overview_layout.addWidget(self.mode_combo, 0, 1)
+        overview_layout.addWidget(QLabel("协议"), 0, 2)
+        overview_layout.addWidget(self.profile_combo, 0, 3)
+        overview_layout.addWidget(self.connection_hint, 0, 4, 1, 3)
+        overview_layout.setColumnStretch(4, 1)
+        tabs.addTab(overview, "连接概览")
 
-        # UDP 状态指示
-        self.udp_status = card_label("UDP 未连接", "#fef2f2", "#991b1b")
-        layout.addWidget(self.udp_status, 0, 4, 1, 2)
-
-        # --- Row 1: UDP 配置 ---
-        layout.addWidget(QLabel("无人机 IP"), 1, 0)
+        udp_page = QWidget()
+        udp_layout = QGridLayout(udp_page)
+        udp_layout.setVerticalSpacing(8)
+        udp_layout.setHorizontalSpacing(10)
         self.ip_edit = QLineEdit("192.168.0.1")
         self.ip_edit.setToolTip("无人机 WiFi 模块 IP 地址")
-        layout.addWidget(self.ip_edit, 1, 1)
-
-        layout.addWidget(QLabel("远端端口"), 1, 2)
         self.remote_udp = QSpinBox()
         self.remote_udp.setRange(1, 65535)
         self.remote_udp.setValue(40000)
         self.remote_udp.setToolTip("无人机 UDP 端口")
-        layout.addWidget(self.remote_udp, 1, 3)
-
-        layout.addWidget(QLabel("本地端口"), 1, 4)
         self.local_udp = QSpinBox()
         self.local_udp.setRange(1, 65535)
         self.local_udp.setValue(40000)
         self.local_udp.setToolTip("本地上位机 UDP 监听端口")
-        layout.addWidget(self.local_udp, 1, 5)
-
         open_udp = QPushButton("打开 UDP")
         open_udp.setObjectName("primary")
         open_udp.setToolTip("打开 UDP 连接，开始接收图传和发送控制")
         close_udp = QPushButton("关闭 UDP")
         heartbeat = QPushButton("UFO 心跳")
-        heartbeat.setToolTip("向无人机发送 WiFi UFO 心跳包，启动图传")
-        layout.addWidget(open_udp, 1, 6)
-        layout.addWidget(close_udp, 1, 7)
-        layout.addWidget(heartbeat, 1, 8)
+        heartbeat.setToolTip("向无人机发送 WiFi UFO 心跳包，启动图传/信息回传")
+        self.udp_status = card_label("UDP 未连接", "#fef2f2", "#991b1b")
+        udp_layout.addWidget(QLabel("无人机 IP"), 0, 0)
+        udp_layout.addWidget(self.ip_edit, 0, 1)
+        udp_layout.addWidget(QLabel("远端端口"), 0, 2)
+        udp_layout.addWidget(self.remote_udp, 0, 3)
+        udp_layout.addWidget(QLabel("本地端口"), 0, 4)
+        udp_layout.addWidget(self.local_udp, 0, 5)
+        udp_layout.addWidget(open_udp, 0, 6)
+        udp_layout.addWidget(close_udp, 0, 7)
+        udp_layout.addWidget(heartbeat, 0, 8)
+        udp_layout.addWidget(self.udp_status, 0, 9)
+        udp_layout.setColumnStretch(9, 1)
+        tabs.addTab(udp_page, "无线 UDP")
 
-        # --- Row 2: 串口配置 ---
-        layout.addWidget(QLabel("飞控串口"), 2, 0)
+        serial_page = QWidget()
+        serial_layout = QGridLayout(serial_page)
+        serial_layout.setVerticalSpacing(8)
+        serial_layout.setHorizontalSpacing(10)
         self.serial_combo = QComboBox()
-        self.serial_combo.setMinimumWidth(220)
+        self.serial_combo.setMinimumWidth(270)
         self.serial_combo.setToolTip("选择飞控对应的串口")
-        layout.addWidget(self.serial_combo, 2, 1, 1, 3)
-
-        layout.addWidget(QLabel("波特率"), 2, 4)
         self.baud_spin = QSpinBox()
         self.baud_spin.setRange(1200, 2_000_000)
         self.baud_spin.setValue(115200)
         self.baud_spin.setToolTip("串口波特率，Cleanflight 默认 115200")
-        layout.addWidget(self.baud_spin, 2, 5)
-
         refresh = QPushButton("刷新串口")
         refresh.setToolTip("重新扫描可用串口列表")
         open_serial = QPushButton("连接串口")
+        open_serial.setObjectName("primary")
         open_serial.setToolTip("连接到选中的飞控串口")
         close_serial = QPushButton("关闭串口")
         self.serial_status = card_label("串口未连接", "#fef2f2", "#991b1b")
-        layout.addWidget(refresh, 2, 6)
-        layout.addWidget(open_serial, 2, 7)
-        layout.addWidget(close_serial, 2, 8)
-        layout.addWidget(self.serial_status, 2, 9)
+        serial_layout.addWidget(QLabel("飞控串口"), 0, 0)
+        serial_layout.addWidget(self.serial_combo, 0, 1, 1, 3)
+        serial_layout.addWidget(QLabel("波特率"), 0, 4)
+        serial_layout.addWidget(self.baud_spin, 0, 5)
+        serial_layout.addWidget(refresh, 0, 6)
+        serial_layout.addWidget(open_serial, 0, 7)
+        serial_layout.addWidget(close_serial, 0, 8)
+        serial_layout.addWidget(self.serial_status, 0, 9)
+        serial_layout.setColumnStretch(9, 1)
+        tabs.addTab(serial_page, "有线串口")
 
-        # 连接信号
+        telemetry_page = QWidget()
+        telemetry_layout = QGridLayout(telemetry_page)
+        telemetry_layout.setVerticalSpacing(8)
+        telemetry_layout.setHorizontalSpacing(10)
+        self.wired_sensor_check = QCheckBox("有线 MSP 传感器默认开启")
+        self.wired_sensor_check.setChecked(True)
+        self.wired_sensor_check.setToolTip("串口连接成功后自动启动 MSP 姿态轮询")
+        self.wireless_sensor_check = QCheckBox("无线 UDP 遥测/图传心跳默认开启")
+        self.wireless_sensor_check.setChecked(True)
+        self.wireless_sensor_check.setToolTip("UDP 打开后自动周期发送 UFO 心跳，维持无线信息/图传入口")
+        self.auto_telemetry_status = card_label("遥测：有线/无线均为默认开启", "#ecfdf5", "#065f46")
+        telemetry_layout.addWidget(self.wired_sensor_check, 0, 0)
+        telemetry_layout.addWidget(self.wireless_sensor_check, 0, 1)
+        telemetry_layout.addWidget(self.auto_telemetry_status, 0, 2, 1, 4)
+        telemetry_layout.setColumnStretch(2, 1)
+        tabs.addTab(telemetry_page, "遥测策略")
+
         self.mode_combo.currentTextChanged.connect(self.apply_interface_mode)
         self.profile_combo.currentTextChanged.connect(self.apply_profile)
+        self.wired_sensor_check.toggled.connect(self.telemetry_strategy_changed)
+        self.wireless_sensor_check.toggled.connect(self.telemetry_strategy_changed)
         open_udp.clicked.connect(self.open_udp)
         close_udp.clicked.connect(self.close_udp)
         heartbeat.clicked.connect(self.send_heartbeat)
         refresh.clicked.connect(self.refresh_ports)
         open_serial.clicked.connect(self.open_serial)
         close_serial.clicked.connect(self.close_serial)
-        return group
+        return tabs
 
     def _center_panel(self) -> QWidget:
         center = QWidget()
@@ -1125,7 +1221,7 @@ class MainWindow(QMainWindow):
 
     def _monitor_tab(self) -> QWidget:
         page = QWidget()
-        page.setMinimumWidth(300)
+        page.setMinimumWidth(420)
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
@@ -1179,7 +1275,7 @@ class MainWindow(QMainWindow):
             row = index // 3
             column = index % 3
             value_label = card_label(f"{title}\n{default}", "#f8fafc", "#334155")
-            value_label.setMinimumHeight(38)
+            value_label.setMinimumHeight(46)
             value_label.setWordWrap(True)
             sensor_grid.addWidget(value_label, row, column)
             self.sensor_cards[key] = value_label
@@ -1201,7 +1297,7 @@ class MainWindow(QMainWindow):
             "QTableWidget { alternate-background-color:#f8fafc; }"
         )
         metric_layout.addWidget(self.metric_table)
-        metric_group.setMinimumHeight(220)
+        metric_group.setMinimumHeight(260)
         layout.addWidget(metric_group, 2)
         self.set_metric("无人机 IP", "192.168.0.1")
         self.set_metric("WiFi 协议", "WiFi UFO UDP 40000")
@@ -1446,6 +1542,21 @@ class MainWindow(QMainWindow):
         diag_grid.setColumnStretch(5, 1)
         layout.addWidget(diag)
 
+        sensor_stream = QGroupBox("传感器传输")
+        stream_grid = QGridLayout(sensor_stream)
+        self.telemetry_mode_status = card_label("传感器：有线 MSP / 无线 UDP 默认开启", "#ecfdf5", "#065f46")
+        start_wired = QPushButton("启动有线 MSP")
+        stop_wired = QPushButton("停止有线 MSP")
+        start_wireless = QPushButton("启动无线心跳")
+        stop_wireless = QPushButton("停止无线心跳")
+        stream_grid.addWidget(self.telemetry_mode_status, 0, 0, 1, 4)
+        stream_grid.addWidget(start_wired, 1, 0)
+        stream_grid.addWidget(stop_wired, 1, 1)
+        stream_grid.addWidget(start_wireless, 1, 2)
+        stream_grid.addWidget(stop_wireless, 1, 3)
+        stream_grid.setColumnStretch(0, 1)
+        layout.addWidget(sensor_stream)
+
         params = QGroupBox("算法参数调试")
         params_layout = QGridLayout(params)
         self.pid_axis_combo = QComboBox()
@@ -1459,6 +1570,11 @@ class MainWindow(QMainWindow):
             spin.setSingleStep(0.5)
             spin.setValue(value)
         make_pid = QPushButton("生成 PID CLI")
+        self.param_filter_edit = QLineEdit()
+        self.param_filter_edit.setPlaceholderText("参数过滤，如 pid / gyro / acc / looptime")
+        get_param = QPushButton("get 参数")
+        diff_params = QPushButton("读取 diff")
+        help_params = QPushButton("CLI help")
         read_params = QPushButton("读取状态/参数")
         send_batch = QPushButton("发送参数批处理")
         save_params = QPushButton("保存参数")
@@ -1482,30 +1598,41 @@ class MainWindow(QMainWindow):
         params_layout.addWidget(QLabel("D"), 0, 6)
         params_layout.addWidget(self.pid_d_spin, 0, 7)
         params_layout.addWidget(make_pid, 0, 8)
-        params_layout.addWidget(self.parameter_batch, 1, 0, 1, 9)
-        params_layout.addWidget(read_params, 2, 0, 1, 2)
-        params_layout.addWidget(send_batch, 2, 2, 1, 2)
-        params_layout.addWidget(save_params, 2, 4, 1, 2)
+        params_layout.addWidget(QLabel("过滤"), 1, 0)
+        params_layout.addWidget(self.param_filter_edit, 1, 1, 1, 3)
+        params_layout.addWidget(get_param, 1, 4)
+        params_layout.addWidget(diff_params, 1, 5)
+        params_layout.addWidget(help_params, 1, 6)
+        params_layout.addWidget(self.parameter_batch, 2, 0, 1, 9)
+        params_layout.addWidget(read_params, 3, 0, 1, 2)
+        params_layout.addWidget(send_batch, 3, 2, 1, 2)
+        params_layout.addWidget(save_params, 3, 4, 1, 2)
         params_layout.setColumnStretch(8, 1)
         layout.addWidget(params)
 
         firmware = QGroupBox("固件烧录准备")
         firmware_grid = QGridLayout(firmware)
+        self.firmware_target_combo = QComboBox()
+        self.firmware_target_combo.addItems(["未知飞控/仅预检", "Cleanflight 兼容", "Betaflight 兼容", "INAV 兼容"])
         self.firmware_path_edit = QLineEdit()
         self.firmware_path_edit.setReadOnly(True)
         self.firmware_path_edit.setPlaceholderText("选择 .hex / .bin 固件文件")
+        self.flash_status = card_label("烧录：等待飞控型号、MCU 与 Bootloader 识别", "#fff7ed", "#c2410c")
         choose_fw = QPushButton("选择固件")
         preflight = QPushButton("烧录前检查")
         bootloader = QPushButton("尝试进入 Bootloader")
         flash = QPushButton("开始烧录")
         flash.setEnabled(False)
         flash.setToolTip("未知飞控暂不开放直接刷写；完成 MCU/Bootloader 识别后再启用")
-        firmware_grid.addWidget(QLabel("固件文件"), 0, 0)
-        firmware_grid.addWidget(self.firmware_path_edit, 0, 1, 1, 4)
-        firmware_grid.addWidget(choose_fw, 0, 5)
-        firmware_grid.addWidget(preflight, 1, 0, 1, 2)
-        firmware_grid.addWidget(bootloader, 1, 2, 1, 2)
-        firmware_grid.addWidget(flash, 1, 4, 1, 2)
+        firmware_grid.addWidget(QLabel("目标"), 0, 0)
+        firmware_grid.addWidget(self.firmware_target_combo, 0, 1)
+        firmware_grid.addWidget(self.flash_status, 0, 2, 1, 4)
+        firmware_grid.addWidget(QLabel("固件文件"), 1, 0)
+        firmware_grid.addWidget(self.firmware_path_edit, 1, 1, 1, 4)
+        firmware_grid.addWidget(choose_fw, 1, 5)
+        firmware_grid.addWidget(preflight, 2, 0, 1, 2)
+        firmware_grid.addWidget(bootloader, 2, 2, 1, 2)
+        firmware_grid.addWidget(flash, 2, 4, 1, 2)
         firmware_grid.setColumnStretch(1, 1)
         layout.addWidget(firmware)
         layout.addStretch(1)
@@ -1515,7 +1642,14 @@ class MainWindow(QMainWindow):
         msp_probe.clicked.connect(self.send_msp_probe)
         msp_once.clicked.connect(self.send_msp_attitude)
         self.msp_poll_btn.clicked.connect(self.toggle_msp_poll)
+        start_wired.clicked.connect(self.start_wired_sensor_stream)
+        stop_wired.clicked.connect(self.stop_wired_sensor_stream)
+        start_wireless.clicked.connect(self.start_wireless_sensor_stream)
+        stop_wireless.clicked.connect(self.stop_wireless_sensor_stream)
         make_pid.clicked.connect(self.generate_pid_cli)
+        get_param.clicked.connect(self.get_parameter_filter)
+        diff_params.clicked.connect(self.read_diff_parameters)
+        help_params.clicked.connect(self.read_cli_help)
         read_params.clicked.connect(self.read_parameters)
         send_batch.clicked.connect(self.send_parameter_batch)
         save_params.clicked.connect(self.save_parameters)
@@ -1639,15 +1773,42 @@ class MainWindow(QMainWindow):
         self.append_log(f"界面模式：{self.mode_combo.currentText()}")
 
     @Slot()
+    def telemetry_strategy_changed(self) -> None:
+        wired = self.wired_sensor_check.isChecked() if hasattr(self, "wired_sensor_check") else True
+        wireless = self.wireless_sensor_check.isChecked() if hasattr(self, "wireless_sensor_check") else True
+        text = f"遥测：有线 MSP {'开' if wired else '关'} / 无线 UDP {'开' if wireless else '关'}"
+        if hasattr(self, "auto_telemetry_status"):
+            self.auto_telemetry_status.setText(text)
+        if hasattr(self, "telemetry_mode_status"):
+            self.telemetry_mode_status.setText(text)
+        if wired and self.serial_worker:
+            self.start_wired_sensor_stream()
+        elif hasattr(self, "msp_timer"):
+            self.msp_timer.stop()
+            if hasattr(self, "msp_poll_btn"):
+                self.msp_poll_btn.setText("开始 MSP 姿态轮询")
+        if wireless and self.wifi_worker:
+            self.start_wireless_sensor_stream()
+        elif hasattr(self, "wireless_telemetry_timer"):
+            self.wireless_telemetry_timer.stop()
+        self.append_log(text)
+
+    @Slot()
     def open_udp(self) -> None:
         if self.wifi_worker and self.wifi_worker.isRunning():
+            if hasattr(self, "wireless_sensor_check") and self.wireless_sensor_check.isChecked():
+                self.start_wireless_sensor_stream()
             return
         self.wifi_worker = WifiUfoWorker(self.ip_edit.text().strip(), self.remote_udp.value(), self.local_udp.value())
         self._connect_worker(self.wifi_worker)
         self.wifi_worker.start()
+        if hasattr(self, "wireless_sensor_check") and self.wireless_sensor_check.isChecked():
+            self.start_wireless_sensor_stream()
 
     @Slot()
     def close_udp(self) -> None:
+        if hasattr(self, "wireless_telemetry_timer"):
+            self.wireless_telemetry_timer.stop()
         if self.wifi_worker:
             self.wifi_worker.stop()
             self.wifi_worker.wait(1200)
@@ -1661,11 +1822,37 @@ class MainWindow(QMainWindow):
             self.wifi_worker.enqueue(("heartbeat",))
 
     @Slot()
+    def poll_wireless_telemetry(self) -> None:
+        if not self.wifi_worker:
+            self.wireless_telemetry_timer.stop()
+            return
+        self.wifi_worker.enqueue(("heartbeat",))
+
+    @Slot()
+    def start_wireless_sensor_stream(self) -> None:
+        if not self.wifi_worker:
+            return
+        self.wifi_worker.enqueue(("heartbeat",))
+        self.wireless_telemetry_timer.start()
+        if hasattr(self, "telemetry_mode_status"):
+            self.telemetry_mode_status.setText("传感器：无线心跳/遥测已开启")
+
+    @Slot()
+    def stop_wireless_sensor_stream(self) -> None:
+        if hasattr(self, "wireless_telemetry_timer"):
+            self.wireless_telemetry_timer.stop()
+        if hasattr(self, "telemetry_mode_status"):
+            self.telemetry_mode_status.setText("传感器：无线心跳/遥测已停止")
+
+    @Slot()
     def open_serial(self) -> None:
         if not self.serial_combo.currentText():
             QMessageBox.information(self, "没有串口", "未发现可用串口。")
             return
         self.close_serial()
+        if self.serial_worker and self.serial_worker.isRunning():
+            self.append_log("旧串口线程仍在退出中，请稍后再连接")
+            return
         worker = CleanflightSerialClient()
         worker.configure(
             self.serial_combo.currentText(),
@@ -1686,9 +1873,12 @@ class MainWindow(QMainWindow):
         if hasattr(self, "msp_poll_btn"):
             self.msp_poll_btn.setText("开始 MSP 姿态轮询")
         if self.serial_worker:
-            self.serial_worker.stop()
-            self.serial_worker.wait(1200)
-            self.serial_worker = None
+            worker = self.serial_worker
+            worker.stop()
+            if worker.wait(450):
+                self.serial_worker = None
+            else:
+                self.append_log("串口线程正在后台退出，界面保持可操作")
 
     def current_serial_line_ending(self) -> str:
         if not hasattr(self, "serial_line_ending_combo"):
@@ -1751,10 +1941,12 @@ class MainWindow(QMainWindow):
     @Slot()
     def toggle_msp_poll(self) -> None:
         if self.msp_timer.isActive():
-            self.msp_timer.stop()
-            self.msp_poll_btn.setText("开始 MSP 姿态轮询")
-            self.serial_diag_status.setText("诊断：MSP 轮询已停止")
+            self.stop_wired_sensor_stream()
             return
+        self.start_wired_sensor_stream()
+
+    @Slot()
+    def start_wired_sensor_stream(self) -> None:
         if not self.serial_worker:
             self.append_log("串口未连接，无法启动 MSP 姿态轮询")
             return
@@ -1762,6 +1954,19 @@ class MainWindow(QMainWindow):
         self.msp_timer.start()
         self.msp_poll_btn.setText("停止 MSP 姿态轮询")
         self.serial_diag_status.setText("诊断：MSP 姿态轮询中")
+        if hasattr(self, "telemetry_mode_status"):
+            self.telemetry_mode_status.setText("传感器：有线 MSP 姿态轮询中")
+
+    @Slot()
+    def stop_wired_sensor_stream(self) -> None:
+        if hasattr(self, "msp_timer"):
+            self.msp_timer.stop()
+        if hasattr(self, "msp_poll_btn"):
+            self.msp_poll_btn.setText("开始 MSP 姿态轮询")
+        if hasattr(self, "serial_diag_status"):
+            self.serial_diag_status.setText("诊断：MSP 轮询已停止")
+        if hasattr(self, "telemetry_mode_status"):
+            self.telemetry_mode_status.setText("传感器：有线 MSP 已停止")
 
     @Slot()
     def auto_probe_serial(self) -> None:
@@ -1771,42 +1976,48 @@ class MainWindow(QMainWindow):
         if self.serial_worker:
             self.append_log("自动波特率探测需要先关闭当前串口连接")
             return
+        if self.serial_probe_worker and self.serial_probe_worker.isRunning():
+            self.append_log("自动波特率探测已在运行")
+            return
         port = self.serial_combo.currentText().split(" - ", 1)[0].strip()
         baud_values = [115200, 57600, 38400, 9600, 230400, 250000]
         self.serial_diag_status.setText("诊断：正在探测波特率...")
         self.append_log(f"开始自动波特率探测：{port}")
-        for baud in baud_values:
-            serial = QSerialPort()
-            serial.setPortName(port)
-            serial.setBaudRate(baud)
-            serial.setDataBits(QSerialPort.Data8)
-            serial.setParity(QSerialPort.NoParity)
-            serial.setStopBits(QSerialPort.OneStop)
-            serial.setFlowControl(QSerialPort.NoFlowControl)
-            if not serial.open(QSerialPort.ReadWrite):
-                self.append_log(f"探测 {baud} 失败：{serial.errorString()}")
-                continue
-            serial.setDataTerminalReady(self.serial_dtr_check.isChecked())
-            serial.setRequestToSend(self.serial_rts_check.isChecked())
-            serial.write(b"\r\n#\r\nversion\r\nstatus\r\n")
-            serial.waitForBytesWritten(120)
-            response = bytearray()
-            deadline = time.monotonic() + 0.45
-            while time.monotonic() < deadline:
-                if serial.waitForReadyRead(50):
-                    response.extend(bytes(serial.readAll()))
-                QApplication.processEvents()
-            serial.write(b"exit\r\n")
-            serial.waitForBytesWritten(100)
-            serial.close()
-            if response:
-                text = bytes(response).decode("utf-8", errors="replace").strip()
-                self.baud_spin.setValue(baud)
-                self.serial_diag_status.setText(f"诊断：{baud} 有返回")
-                self.append_log(f"波特率 {baud} 收到返回：{text[:160] if text else response.hex(' ')}")
-                return
-            self.append_log(f"波特率 {baud} 无返回")
-        self.serial_diag_status.setText("诊断：未探测到串口返回")
+        worker = SerialProbeWorker()
+        worker.configure(
+            self.serial_combo.currentText(),
+            baud_values,
+            self.serial_dtr_check.isChecked(),
+            self.serial_rts_check.isChecked(),
+        )
+        worker.progress.connect(self._serial_probe_progress)
+        worker.found.connect(self._serial_probe_found)
+        worker.probe_finished.connect(self._serial_probe_finished)
+        worker.finished.connect(self._serial_probe_thread_done)
+        self.serial_probe_worker = worker
+        worker.start()
+
+    @Slot(str)
+    def _serial_probe_progress(self, message: str) -> None:
+        self.append_log(message)
+
+    @Slot(int, str)
+    def _serial_probe_found(self, baud: int, response: str) -> None:
+        self.baud_spin.setValue(baud)
+        self.serial_diag_status.setText(f"诊断：{baud} 有返回")
+        self.append_log(f"波特率 {baud} 收到返回：{response[:180]}")
+
+    @Slot(bool)
+    def _serial_probe_finished(self, ok: bool) -> None:
+        if ok:
+            self.append_log("自动波特率探测完成")
+        else:
+            self.serial_diag_status.setText("诊断：未探测到串口返回")
+            self.append_log("自动波特率探测结束：未找到可读返回")
+
+    @Slot()
+    def _serial_probe_thread_done(self) -> None:
+        self.serial_probe_worker = None
 
     @Slot()
     def generate_pid_cli(self) -> None:
@@ -1829,6 +2040,34 @@ class MainWindow(QMainWindow):
         for line in ("#", "version", "status", "dump"):
             self.serial_worker.enqueue_line(line)
         self.serial_diag_status.setText("诊断：已请求 version/status/dump")
+
+    @Slot()
+    def get_parameter_filter(self) -> None:
+        if not self.serial_worker:
+            self.append_log("串口未连接，无法读取参数")
+            return
+        key = self.param_filter_edit.text().strip()
+        self.serial_worker.enqueue_line("#")
+        self.serial_worker.enqueue_line(f"get {key}" if key else "get")
+        self.serial_diag_status.setText(f"诊断：已请求 get {key}".strip())
+
+    @Slot()
+    def read_diff_parameters(self) -> None:
+        if not self.serial_worker:
+            self.append_log("串口未连接，无法读取 diff")
+            return
+        self.serial_worker.enqueue_line("#")
+        self.serial_worker.enqueue_line("diff")
+        self.serial_diag_status.setText("诊断：已请求 diff")
+
+    @Slot()
+    def read_cli_help(self) -> None:
+        if not self.serial_worker:
+            self.append_log("串口未连接，无法读取 CLI help")
+            return
+        self.serial_worker.enqueue_line("#")
+        self.serial_worker.enqueue_line("help")
+        self.serial_diag_status.setText("诊断：已请求 help")
 
     @Slot()
     def send_parameter_batch(self) -> None:
@@ -1890,17 +2129,23 @@ class MainWindow(QMainWindow):
         if firmware and not Path(firmware).exists():
             QMessageBox.warning(self, "固件不存在", "选择的固件文件不存在。")
             return
+        target = self.firmware_target_combo.currentText() if hasattr(self, "firmware_target_combo") else "未知飞控"
         self.append_log("烧录前检查：开始识别飞控固件、串口协议和 Bootloader 状态")
+        self.append_log(f"目标类型：{target}")
         if firmware:
             self.append_log(f"待烧录固件：{firmware}")
         else:
             self.append_log("未选择固件；仅执行飞控识别检查")
         self.append_log("安全策略：未知 MCU/Bootloader 前不会直接刷写固件，避免飞控变砖或安全逻辑失效")
+        if hasattr(self, "flash_status"):
+            self.flash_status.setText(f"烧录预检：{target}，等待飞控识别结果")
         if self.serial_worker:
             self.serial_worker.enqueue_cli_probe()
             self.serial_worker.enqueue_msp_probe()
         else:
             self.append_log("串口未连接：请先选择 COM 口并连接，再执行完整预检")
+            if hasattr(self, "flash_status"):
+                self.flash_status.setText("烧录预检：串口未连接")
 
     @Slot()
     def request_bootloader(self) -> None:
@@ -2292,7 +2537,11 @@ class MainWindow(QMainWindow):
                 "QLabel { background:#ecfdf5; color:#065f46; border:1px solid #a7f3d0; "
                 "border-radius:6px; padding:6px 10px; font-weight:500; }"
             )
+            if hasattr(self, "wireless_sensor_check") and self.wireless_sensor_check.isChecked():
+                self.start_wireless_sensor_stream()
         elif "断开" in status or "错误" in status:
+            if hasattr(self, "wireless_telemetry_timer"):
+                self.wireless_telemetry_timer.stop()
             self.udp_status.setStyleSheet(
                 "QLabel { background:#fef2f2; color:#991b1b; border:1px solid #fecaca; "
                 "border-radius:6px; padding:6px 10px; font-weight:500; }"
@@ -2320,6 +2569,8 @@ class MainWindow(QMainWindow):
             if self.serial_worker:
                 port_info = f"{self.serial_worker.port_label} @ {self.serial_worker.baud}"
                 self.set_metric("串口飞控", port_info)
+            if hasattr(self, "wired_sensor_check") and self.wired_sensor_check.isChecked():
+                self.start_wired_sensor_stream()
         elif "未连接" in status or "失败" in status:
             if hasattr(self, "msp_timer"):
                 self.msp_timer.stop()
