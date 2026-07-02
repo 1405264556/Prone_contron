@@ -968,7 +968,7 @@ class MainWindow(QMainWindow):
         self.wireless_telemetry_timer.setInterval(700)
         self.wireless_telemetry_timer.timeout.connect(self.poll_wireless_telemetry)
         self.refresh_ports()
-        self.apply_profile()
+        self.apply_scene_preset()
         self.update_control_transport_status()
         self.reset_hover()
         self.mark_attitude_unavailable()
@@ -1122,11 +1122,20 @@ class MainWindow(QMainWindow):
         tabs = QTabWidget()
         tabs.setDocumentMode(True)
         tabs.setMaximumHeight(190)
+        self.connection_tabs = tabs
 
         overview = QWidget()
         overview_layout = QGridLayout(overview)
         overview_layout.setVerticalSpacing(8)
         overview_layout.setHorizontalSpacing(10)
+        self.scene_combo = QComboBox()
+        self.scene_combo.addItems([
+            "WiFi飞行/图传",
+            "有线调参/传感器",
+            "有线控电机（需RX_MSP）",
+            "恢复WiFi控制（RX_PPM）",
+        ])
+        self.scene_combo.setToolTip("先选择当前硬件连接场景，再点击一键开始")
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["使用者界面", "开发者界面"])
         self.mode_combo.setToolTip("使用者界面隐藏底部开发者区，开发者界面显示 CLI 与安全说明")
@@ -1143,14 +1152,22 @@ class MainWindow(QMainWindow):
         ])
         self.control_transport_combo.setToolTip("这台硬件插有线时 WiFi 可能不启动；普通串口也不能传摄像图像")
         self.control_transport_status = card_label("WiFi模式：控制/图传可用，IMU需串口", "#f8fafc", "#334155")
-        overview_layout.addWidget(QLabel("界面模式"), 0, 0)
-        overview_layout.addWidget(self.mode_combo, 0, 1)
-        overview_layout.addWidget(QLabel("协议"), 0, 2)
-        overview_layout.addWidget(self.profile_combo, 0, 3)
-        overview_layout.addWidget(self.connection_hint, 0, 4, 1, 3)
-        overview_layout.addWidget(QLabel("控制链路"), 1, 0)
-        overview_layout.addWidget(self.control_transport_combo, 1, 1, 1, 3)
-        overview_layout.addWidget(self.control_transport_status, 1, 4, 1, 3)
+        self.apply_scene_btn = QPushButton("应用场景")
+        self.apply_scene_btn.setObjectName("primary")
+        self.quick_start_btn = QPushButton("一键开始")
+        self.quick_start_btn.setObjectName("primary")
+        self.scene_status = card_label("选择场景后点击一键开始", "#eff6ff", "#1e40af")
+        overview_layout.addWidget(QLabel("场景"), 0, 0)
+        overview_layout.addWidget(self.scene_combo, 0, 1, 1, 3)
+        overview_layout.addWidget(self.apply_scene_btn, 0, 4)
+        overview_layout.addWidget(self.quick_start_btn, 0, 5)
+        overview_layout.addWidget(self.scene_status, 0, 6, 1, 2)
+        overview_layout.addWidget(QLabel("界面"), 1, 0)
+        overview_layout.addWidget(self.mode_combo, 1, 1)
+        overview_layout.addWidget(QLabel("控制链路"), 1, 2)
+        overview_layout.addWidget(self.control_transport_combo, 1, 3, 1, 2)
+        overview_layout.addWidget(self.control_transport_status, 1, 5, 1, 3)
+        overview_layout.addWidget(self.connection_hint, 2, 0, 1, 8)
         overview_layout.setColumnStretch(4, 1)
         tabs.addTab(overview, "连接概览")
 
@@ -1177,14 +1194,16 @@ class MainWindow(QMainWindow):
         self.udp_status = card_label("UDP 未连接", "#fef2f2", "#991b1b")
         udp_layout.addWidget(QLabel("无人机 IP"), 0, 0)
         udp_layout.addWidget(self.ip_edit, 0, 1)
-        udp_layout.addWidget(QLabel("远端端口"), 0, 2)
-        udp_layout.addWidget(self.remote_udp, 0, 3)
-        udp_layout.addWidget(QLabel("本地端口"), 0, 4)
-        udp_layout.addWidget(self.local_udp, 0, 5)
-        udp_layout.addWidget(open_udp, 0, 6)
-        udp_layout.addWidget(close_udp, 0, 7)
-        udp_layout.addWidget(heartbeat, 0, 8)
-        udp_layout.addWidget(self.udp_status, 0, 9)
+        udp_layout.addWidget(QLabel("协议"), 0, 2)
+        udp_layout.addWidget(self.profile_combo, 0, 3)
+        udp_layout.addWidget(QLabel("远端端口"), 0, 4)
+        udp_layout.addWidget(self.remote_udp, 0, 5)
+        udp_layout.addWidget(QLabel("本地端口"), 0, 6)
+        udp_layout.addWidget(self.local_udp, 0, 7)
+        udp_layout.addWidget(open_udp, 0, 8)
+        udp_layout.addWidget(close_udp, 0, 9)
+        udp_layout.addWidget(heartbeat, 0, 10)
+        udp_layout.addWidget(self.udp_status, 0, 11)
         udp_layout.setColumnStretch(9, 1)
         tabs.addTab(udp_page, "无线 UDP")
 
@@ -1235,6 +1254,9 @@ class MainWindow(QMainWindow):
         tabs.addTab(telemetry_page, "遥测策略")
 
         self.mode_combo.currentTextChanged.connect(self.apply_interface_mode)
+        self.scene_combo.currentTextChanged.connect(self.apply_scene_preset)
+        self.apply_scene_btn.clicked.connect(self.apply_scene_preset)
+        self.quick_start_btn.clicked.connect(self.quick_start_scene)
         self.profile_combo.currentTextChanged.connect(self.apply_profile)
         self.control_transport_combo.currentTextChanged.connect(self.update_control_transport_status)
         self.wired_sensor_check.toggled.connect(self.telemetry_strategy_changed)
@@ -1761,9 +1783,10 @@ class MainWindow(QMainWindow):
             "</style>"
             "<ol>"
             "<li><b>拆桨或固定机体</b> —— 测试前务必拆掉螺旋桨或用夹具固定无人机。</li>"
-            "<li><b>连接无人机 WiFi</b> —— 将电脑连接到 <code>WiFiUFO-3BE7F2</code> 热点。</li>"
-            "<li><b>点击 UFO 心跳</b> —— 启动 WiFi UFO UDP 40000 图传和控制通道。</li>"
-            "<li><b>选择界面模式</b> —— 使用者界面只显示监控和飞行控制；开发者界面额外显示 CLI。</li>"
+            "<li><b>选择场景</b> —— 首页选择 WiFi飞行/图传、有线调参或有线控电机。</li>"
+            "<li><b>一键开始</b> —— 程序会自动配置 UDP/串口、遥测策略和控制链路。</li>"
+            "<li><b>WiFi 模式</b> —— 用于控制和图传；当前 WiFiUFO 未发现真实 IMU 姿态回传。</li>"
+            "<li><b>有线模式</b> —— 用于 CLI/MSP 传感器；有线控电机需要飞控接收机功能为 RX_MSP。</li>"
             "<li><b>持续方向控制</b> —— 按住方向按钮或键盘按键持续发送指令, 松开自动回中悬停。</li>"
             "<li><b>滑块微调</b> —— 拖动滑块实时调整控制量, 自动以 50ms 间隔持续发送。</li>"
             "<li class='warn'>所有飞行动作默认锁定，必须勾选安全确认后才会发出！</li>"
@@ -1846,6 +1869,67 @@ class MainWindow(QMainWindow):
             self.remote_udp.setValue(8889)
             self.local_udp.setValue(8890)
         self.append_log(f"协议配置：{profile}")
+
+    def apply_scene_preset(self, *_ignored: object) -> None:
+        scene = self.scene_combo.currentText() if hasattr(self, "scene_combo") else "WiFi飞行/图传"
+        if scene.startswith("WiFi"):
+            self.profile_combo.setCurrentText("WiFi UFO UDP")
+            self.control_transport_combo.setCurrentIndex(0)
+            self.wired_sensor_check.setChecked(False)
+            self.wireless_sensor_check.setChecked(True)
+            self.mode_combo.setCurrentText("使用者界面")
+            self.scene_status.setText("步骤：连接无人机WiFi -> 一键开始")
+        elif scene.startswith("有线调参"):
+            self.profile_combo.setCurrentText("仅串口 Cleanflight")
+            self.control_transport_combo.setCurrentIndex(1)
+            self.wired_sensor_check.setChecked(True)
+            self.wireless_sensor_check.setChecked(False)
+            self.mode_combo.setCurrentText("开发者界面")
+            self.scene_status.setText("步骤：插USB -> 一键开始 -> 查看传感器/CLI")
+        elif scene.startswith("有线控电机"):
+            self.profile_combo.setCurrentText("仅串口 Cleanflight")
+            self.control_transport_combo.setCurrentIndex(2)
+            self.wired_sensor_check.setChecked(True)
+            self.wireless_sensor_check.setChecked(False)
+            self.mode_combo.setCurrentText("开发者界面")
+            self.scene_status.setText("步骤：先检测接收机，确认RX_MSP后再解锁")
+        else:
+            self.profile_combo.setCurrentText("仅串口 Cleanflight")
+            self.control_transport_combo.setCurrentIndex(1)
+            self.wired_sensor_check.setChecked(True)
+            self.wireless_sensor_check.setChecked(False)
+            self.mode_combo.setCurrentText("开发者界面")
+            self.scene_status.setText("步骤：插USB -> 一键开始 -> 恢复WiFi/RX_PPM")
+        self.apply_profile()
+        self.update_control_transport_status()
+        self.telemetry_strategy_changed()
+        self.append_log(f"已应用场景：{scene}")
+
+    @Slot()
+    def quick_start_scene(self) -> None:
+        scene = self.scene_combo.currentText()
+        self.apply_scene_preset()
+        if scene.startswith("WiFi"):
+            self.close_serial()
+            self.open_udp()
+            self.send_heartbeat()
+            self.scene_status.setText("已启动WiFi UDP：等待图传/控制")
+            if hasattr(self, "connection_tabs"):
+                self.connection_tabs.setCurrentIndex(0)
+            return
+
+        self.close_udp()
+        self.open_serial()
+        if scene.startswith("有线调参"):
+            self.scene_status.setText("已启动有线调参：连接后自动轮询MSP")
+        elif scene.startswith("有线控电机"):
+            self.scene_status.setText("已启动有线检测：请确认接收机为RX_MSP")
+        else:
+            self.scene_status.setText("已启动恢复流程：连接后点击恢复WiFi/RX_PPM")
+        if hasattr(self, "connection_tabs"):
+            self.connection_tabs.setCurrentIndex(0)
+        if self.serial_worker:
+            self.detect_receiver_mode()
 
     @Slot()
     def update_control_transport_status(self) -> None:
