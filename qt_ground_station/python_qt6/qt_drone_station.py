@@ -57,11 +57,16 @@ WIFI_UFO_CONTROL_TEMPLATE = bytearray.fromhex("63 63 0a 00 00 08 00 66 80 80 80 
 VIDEO_FRAGMENT_HEADER_OFFSET = 47
 VIDEO_PAYLOAD_OFFSET = 54
 CONTROL_INTERVAL = 0.02  # 标准遥控刷新目标 50Hz，避免过高包频让廉价 WiFi 飞控忽略控制
+SERIAL_CONTROL_INTERVAL = 0.05  # MSP_SET_RAW_RC 走串口，20Hz 更稳，避免和遥测抢带宽
 IDLE_THROTTLE = 128  # WiFiUFO 中位油门；起飞/解锁后用它维持待机/悬停控制
+WIRED_IDLE_THROTTLE = 0  # MSP RC 油门最低；电机怠速由飞控的 arm/min_throttle 逻辑决定
 HEARTBEAT_INTERVAL = 0.5
 ARM_PULSE_DURATION = 1.0
 ARMED_HOLD_MODE = 1
 CLEANFLIGHT_ARM_DURATION = 4.0
+MSP_RC_LOW = 1000
+MSP_RC_MID = 1500
+MSP_RC_HIGH = 2000
 
 
 def clamp_byte(value: int) -> int:
@@ -569,6 +574,7 @@ class CleanflightSerialClient(QThread):
     MSP_RAW_IMU = 102
     MSP_ATTITUDE = 108
     MSP_ANALOG = 110
+    MSP_SET_RAW_RC = 200
 
     def __init__(self) -> None:
         super().__init__()
@@ -629,6 +635,13 @@ class CleanflightSerialClient(QThread):
 
     def enqueue_msp_attitude(self, silent: bool = False) -> None:
         self.commands.put(("msp", self.MSP_ATTITUDE, "MSP_ATTITUDE", silent))
+
+    def enqueue_msp_rc(self, channels: list[int], label: str = "MSP_SET_RAW_RC", silent: bool = False) -> None:
+        safe_channels = [max(900, min(2100, int(value))) for value in channels[:8]]
+        while len(safe_channels) < 8:
+            safe_channels.append(MSP_RC_LOW)
+        payload = b"".join(value.to_bytes(2, "little", signed=False) for value in safe_channels)
+        self.commands.put(("msp_payload", self.MSP_SET_RAW_RC, payload, label, silent))
 
     def enqueue_raw(self, payload: bytes, label: str = "RAW") -> None:
         self.commands.put(("raw", payload, label))
@@ -693,6 +706,12 @@ class CleanflightSerialClient(QThread):
                         silent = len(cmd) > 3 and bool(cmd[3])
                         if not silent:
                             self.log_message.emit(f"MSP TX：{cmd[2]}")
+                    elif cmd[0] == "msp_payload":
+                        payload = self._msp_packet(int(cmd[1]), bytes(cmd[2]))
+                        serial.write(payload)
+                        serial.waitForBytesWritten(80)
+                        if not bool(cmd[4]):
+                            self.log_message.emit(f"MSP TX：{cmd[3]}")
                     elif cmd[0] == "raw":
                         serial.write(cmd[1])
                         serial.waitForBytesWritten(80)
@@ -729,8 +748,16 @@ class CleanflightSerialClient(QThread):
 
     @staticmethod
     def _msp_request(command: int) -> bytes:
+        return CleanflightSerialClient._msp_packet(command, b"")
+
+    @staticmethod
+    def _msp_packet(command: int, payload: bytes) -> bytes:
         command &= 0xFF
-        return b"$M<" + bytes((0, command, command))
+        size = len(payload) & 0xFF
+        checksum = size ^ command
+        for value in payload:
+            checksum ^= value
+        return b"$M<" + bytes((size, command)) + payload + bytes((checksum,))
 
     @staticmethod
     def _int16(payload: bytes, offset: int) -> int:
@@ -908,18 +935,30 @@ class MainWindow(QMainWindow):
         self.last_live_attitude_at = 0.0
         self.last_control_log = 0.0
         self.last_control_status = 0.0
+        self.last_serial_control_log = 0.0
         self.flight_armed = False
+        self.serial_rc_active = False
+        self.serial_rc_state = ControlState(128, 128, WIRED_IDLE_THROTTLE, 128)
+        self.serial_rc_label = "有线待机"
+        self.serial_burst_until = 0.0
+        self.serial_burst_state = ControlState(128, 128, WIRED_IDLE_THROTTLE, 128)
+        self.serial_burst_label = ""
+        self.serial_burst_auto_idle = False
         self.log_path = QT_LOG_DIR / f"qt6_ground_station_{QDateTime.currentDateTime().toString('yyyyMMdd_HHmmss')}.log"
         self.log_file = self.log_path.open("a", encoding="utf-8")
         self._build_ui()
         self.msp_timer = QTimer(self)
         self.msp_timer.setInterval(200)
         self.msp_timer.timeout.connect(self.poll_msp_attitude)
+        self.serial_control_timer = QTimer(self)
+        self.serial_control_timer.setInterval(int(SERIAL_CONTROL_INTERVAL * 1000))
+        self.serial_control_timer.timeout.connect(self.tick_serial_control)
         self.wireless_telemetry_timer = QTimer(self)
         self.wireless_telemetry_timer.setInterval(700)
         self.wireless_telemetry_timer.timeout.connect(self.poll_wireless_telemetry)
         self.refresh_ports()
         self.apply_profile()
+        self.update_control_transport_status()
         self.reset_hover()
         self.mark_attitude_unavailable()
         self.apply_interface_mode()
@@ -928,6 +967,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: N802
         if hasattr(self, "msp_timer"):
             self.msp_timer.stop()
+        if hasattr(self, "serial_control_timer"):
+            self.serial_control_timer.stop()
         if hasattr(self, "wireless_telemetry_timer"):
             self.wireless_telemetry_timer.stop()
         if self.serial_probe_worker:
@@ -1069,7 +1110,7 @@ class MainWindow(QMainWindow):
     def _top_panel(self) -> QTabWidget:
         tabs = QTabWidget()
         tabs.setDocumentMode(True)
-        tabs.setMaximumHeight(165)
+        tabs.setMaximumHeight(190)
 
         overview = QWidget()
         overview_layout = QGridLayout(overview)
@@ -1082,11 +1123,23 @@ class MainWindow(QMainWindow):
         self.profile_combo.addItems(["WiFi UFO UDP", "Tello 兼容 UDP", "仅串口 Cleanflight"])
         self.profile_combo.setToolTip("选择通信协议，自动配置默认端口")
         self.connection_hint = card_label("连接策略：无线/有线遥测默认开启", "#eff6ff", "#1e40af")
+        self.control_transport_combo = QComboBox()
+        self.control_transport_combo.addItems([
+            "自动：有线优先 + WiFi 图传",
+            "无线 UDP 控制/图传",
+            "有线 MSP RC 控制",
+            "混合：有线控电机 + WiFi 图传",
+        ])
+        self.control_transport_combo.setToolTip("普通串口无法承载摄像图传；需要图像时请使用 WiFi UDP 或混合模式")
+        self.control_transport_status = card_label("控制：自动，有线优先；图传：WiFi UDP", "#f8fafc", "#334155")
         overview_layout.addWidget(QLabel("界面模式"), 0, 0)
         overview_layout.addWidget(self.mode_combo, 0, 1)
         overview_layout.addWidget(QLabel("协议"), 0, 2)
         overview_layout.addWidget(self.profile_combo, 0, 3)
         overview_layout.addWidget(self.connection_hint, 0, 4, 1, 3)
+        overview_layout.addWidget(QLabel("控制链路"), 1, 0)
+        overview_layout.addWidget(self.control_transport_combo, 1, 1, 1, 3)
+        overview_layout.addWidget(self.control_transport_status, 1, 4, 1, 3)
         overview_layout.setColumnStretch(4, 1)
         tabs.addTab(overview, "连接概览")
 
@@ -1172,6 +1225,7 @@ class MainWindow(QMainWindow):
 
         self.mode_combo.currentTextChanged.connect(self.apply_interface_mode)
         self.profile_combo.currentTextChanged.connect(self.apply_profile)
+        self.control_transport_combo.currentTextChanged.connect(self.update_control_transport_status)
         self.wired_sensor_check.toggled.connect(self.telemetry_strategy_changed)
         self.wireless_sensor_check.toggled.connect(self.telemetry_strategy_changed)
         open_udp.clicked.connect(self.open_udp)
@@ -1331,6 +1385,9 @@ class MainWindow(QMainWindow):
 
         self.command_status = card_label("当前命令：待机", "#eff6ff", "#1e40af")
         layout.addWidget(self.command_status)
+
+        self.control_link_card = card_label("控制链路：自动，有线优先", "#f8fafc", "#334155")
+        layout.addWidget(self.control_link_card)
 
         arm_mode = QGroupBox("解锁方案")
         arm_mode_layout = QGridLayout(arm_mode)
@@ -1764,6 +1821,69 @@ class MainWindow(QMainWindow):
         self.append_log(f"协议配置：{profile}")
 
     @Slot()
+    def update_control_transport_status(self) -> None:
+        text = self.control_transport_combo.currentText() if hasattr(self, "control_transport_combo") else "自动"
+        if "有线 MSP RC" in text:
+            status = "控制：有线 MSP RC；图传：需 WiFi UDP"
+        elif "混合" in text:
+            status = "控制：有线 MSP RC；图传：WiFi UDP"
+        elif "无线" in text:
+            status = "控制/图传：WiFi UDP"
+        else:
+            status = "控制：自动，有线优先；图传：WiFi UDP"
+        if hasattr(self, "control_transport_status"):
+            self.control_transport_status.setText(status)
+        if hasattr(self, "control_link_card"):
+            self.control_link_card.setText(status)
+        self.set_metric("控制链路", status)
+
+    def serial_link_ready(self) -> bool:
+        return bool(self.serial_worker and self.serial_worker.isRunning())
+
+    def use_wired_control(self) -> bool:
+        text = self.control_transport_combo.currentText() if hasattr(self, "control_transport_combo") else "自动"
+        if text.startswith("自动"):
+            return self.serial_link_ready()
+        if "无线 UDP" in text:
+            return False
+        if "有线" in text or "混合" in text:
+            return True
+        return False
+
+    def use_wifi_control(self) -> bool:
+        text = self.control_transport_combo.currentText() if hasattr(self, "control_transport_combo") else "自动"
+        if text.startswith("自动"):
+            return not self.serial_link_ready()
+        if "无线 UDP" in text:
+            return True
+        if "有线" in text or "混合" in text:
+            return False
+        return True
+
+    def should_keep_wifi_video(self) -> bool:
+        text = self.control_transport_combo.currentText() if hasattr(self, "control_transport_combo") else "自动"
+        wireless_enabled = self.wireless_sensor_check.isChecked() if hasattr(self, "wireless_sensor_check") else True
+        return wireless_enabled or "图传" in text or "混合" in text
+
+    def prepare_video_link(self) -> None:
+        if self.should_keep_wifi_video():
+            self.open_udp()
+
+    def prepare_control_link(self, action: str) -> bool:
+        self.update_control_transport_status()
+        if self.use_wired_control():
+            if not self.serial_link_ready():
+                QMessageBox.information(self, "有线控制未连接", f"“{action}” 选择了有线 MSP RC 控制，请先连接飞控串口。")
+                self.append_log(f"已阻止动作：{action}，原因：有线 MSP RC 未连接")
+                return False
+            if self.serial_worker:
+                self.serial_worker.enqueue_line("exit")
+            self.prepare_video_link()
+            return True
+        self.open_udp()
+        return True
+
+    @Slot()
     def apply_interface_mode(self) -> None:
         developer = self.mode_combo.currentText() == "开发者界面"
         if hasattr(self, "dev_tabs"):
@@ -1868,6 +1988,7 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def close_serial(self) -> None:
+        self.stop_serial_rc_control()
         if hasattr(self, "msp_timer"):
             self.msp_timer.stop()
         if hasattr(self, "msp_poll_btn"):
@@ -2177,9 +2298,91 @@ class MainWindow(QMainWindow):
             self.wifi_worker.enqueue(("set_control", self.current_control()))
             if self.unlock_check.isChecked() and self.flight_armed:
                 self.wifi_worker.enqueue(("hold_update", self.current_control(), "滑块控制"))
+        if self.use_wired_control() and self.flight_armed:
+            self.set_serial_rc_state(self.current_control(), "滑块控制")
 
     def current_control(self) -> ControlState:
         return ControlState(self.roll.value(), self.pitch.value(), self.throttle.value(), self.yaw.value())
+
+    @staticmethod
+    def rc_from_byte(value: int) -> int:
+        value = clamp_byte(value)
+        if value == 128:
+            return MSP_RC_MID
+        if value < 128:
+            return MSP_RC_LOW + round(value * (MSP_RC_MID - MSP_RC_LOW) / 128)
+        return MSP_RC_MID + round((value - 128) * (MSP_RC_HIGH - MSP_RC_MID) / 127)
+
+    def serial_channels_from_control(self, state: ControlState) -> list[int]:
+        state = state.clamped()
+        return [
+            self.rc_from_byte(state.roll),
+            self.rc_from_byte(state.pitch),
+            self.rc_from_byte(state.yaw),
+            self.rc_from_byte(state.throttle),
+            MSP_RC_LOW,
+            MSP_RC_LOW,
+            MSP_RC_LOW,
+            MSP_RC_LOW,
+        ]
+
+    def send_serial_rc_state(self, state: ControlState, label: str, silent: bool = True) -> None:
+        if not self.serial_link_ready() or not self.serial_worker:
+            return
+        self.serial_worker.enqueue_msp_rc(self.serial_channels_from_control(state), label, silent)
+        now = time.monotonic()
+        if now - self.last_serial_control_log > 0.8:
+            channels = self.serial_channels_from_control(state)
+            self.append_log(
+                f"有线RC：{label} R{channels[0]} P{channels[1]} Y{channels[2]} T{channels[3]}"
+            )
+            self.last_serial_control_log = now
+
+    def set_serial_rc_state(self, state: ControlState, label: str) -> None:
+        self.serial_rc_state = state.clamped()
+        self.serial_rc_label = label
+        self.serial_rc_active = True
+        if not self.serial_control_timer.isActive():
+            self.serial_control_timer.start()
+
+    def start_serial_rc_burst(self, state: ControlState, duration: float, label: str, auto_idle: bool) -> None:
+        if self.serial_worker:
+            self.serial_worker.enqueue_line("exit")
+        self.serial_burst_state = state.clamped()
+        self.serial_burst_label = label
+        self.serial_burst_until = time.monotonic() + max(0.1, float(duration))
+        self.serial_burst_auto_idle = auto_idle
+        self.serial_rc_active = False
+        self.serial_control_timer.start()
+        self.append_log(f"开始有线RC脉冲：{label} {duration:.1f} 秒")
+
+    def stop_serial_rc_control(self) -> None:
+        self.serial_burst_until = 0.0
+        self.serial_burst_auto_idle = False
+        self.serial_rc_active = False
+        if hasattr(self, "serial_control_timer"):
+            self.serial_control_timer.stop()
+
+    @Slot()
+    def tick_serial_control(self) -> None:
+        if not self.serial_link_ready():
+            self.stop_serial_rc_control()
+            return
+        now = time.monotonic()
+        if self.serial_burst_until:
+            if now < self.serial_burst_until:
+                self.send_serial_rc_state(self.serial_burst_state, self.serial_burst_label, True)
+                return
+            self.append_log(f"有线RC脉冲结束：{self.serial_burst_label}")
+            self.serial_burst_until = 0.0
+            if self.serial_burst_auto_idle:
+                self.set_serial_rc_state(ControlState(128, 128, WIRED_IDLE_THROTTLE, 128), "有线待机")
+                self.command_status.setText("当前命令：有线待机")
+            else:
+                self.stop_serial_rc_control()
+                return
+        if self.serial_rc_active:
+            self.send_serial_rc_state(self.serial_rc_state, self.serial_rc_label, True)
 
     def current_active_mode(self) -> int:
         if not hasattr(self, "arm_profile_combo"):
@@ -2202,7 +2405,9 @@ class MainWindow(QMainWindow):
         self.throttle.setValue(IDLE_THROTTLE)
         self.yaw.setValue(128)
         self.update_control()
-        if self.wifi_worker:
+        if self.use_wired_control() and self.flight_armed:
+            self.set_serial_rc_state(ControlState(128, 128, WIRED_IDLE_THROTTLE, 128), "有线待机")
+        elif self.wifi_worker:
             self.wifi_worker.enqueue(("hold_stop",))
             self.wifi_worker.enqueue(("stop_stream",))
         self.command_status.setText("当前命令：待机")
@@ -2235,6 +2440,7 @@ class MainWindow(QMainWindow):
         self.append_log("安全锁已手动解锁" if checked else "安全锁已锁定")
         if not checked:
             self.flight_armed = False
+            self.stop_serial_rc_control()
             if self.wifi_worker:
                 self.wifi_worker.enqueue(("hold_stop",))
                 self.wifi_worker.enqueue(("stop_stream",))
@@ -2250,8 +2456,8 @@ class MainWindow(QMainWindow):
     def ensure_flight_armed(self, action: str) -> bool:
         if self.flight_armed:
             return True
-        QMessageBox.information(self, "尚未解锁待机", f"“{action}” 需要先点击“解锁待机”，等待无人机进入待机怠速。")
-        self.append_log(f"已阻止动作：{action}，原因：尚未执行 WiFiUFO 解锁待机")
+        QMessageBox.information(self, "尚未解锁待机", f"“{action}” 需要先点击“解锁待机”，等待无人机进入待机状态。")
+        self.append_log(f"已阻止动作：{action}，原因：尚未执行解锁待机")
         return False
 
     def start_hold(
@@ -2268,25 +2474,33 @@ class MainWindow(QMainWindow):
             return
         if not self.ensure_flight_armed(label):
             return
-        self.open_udp()
         state = ControlState(roll, pitch, throttle, yaw)
-        if self.wifi_worker:
+        if not self.prepare_control_link(label):
+            return
+        if self.use_wired_control():
+            self.set_serial_rc_state(state, label)
+        elif self.wifi_worker:
             self.wifi_worker.enqueue(("hold_start", state, label))
         self.command_status.setText(f"持续控制：{label}")
 
     @Slot()
     def stop_hold(self) -> None:
         """完全停止控制（发送回中包后不再发送）."""
-        if self.wifi_worker:
+        if self.use_wired_control() and self.flight_armed:
+            self.set_serial_rc_state(ControlState(128, 128, WIRED_IDLE_THROTTLE, 128), "有线待机")
+            self.command_status.setText("当前命令：有线待机")
+        elif self.wifi_worker:
             self.wifi_worker.enqueue(("hold_stop",))
-        self.command_status.setText("当前命令：已停机")
+            self.command_status.setText("当前命令：已停机")
 
     @Slot()
     def stop_hold_to_idle(self) -> None:
         """松开方向键后回到待机怠速状态（而非完全停机）."""
         if not self.flight_armed:
             return
-        if self.wifi_worker:
+        if self.use_wired_control():
+            self.set_serial_rc_state(ControlState(128, 128, WIRED_IDLE_THROTTLE, 128), "有线待机")
+        elif self.wifi_worker:
             state = ControlState(128, 128, IDLE_THROTTLE, 128)
             self.wifi_worker.enqueue(("hold_start", state, "待机怠速"))
         self.command_status.setText("当前命令：待机怠速")
@@ -2296,8 +2510,14 @@ class MainWindow(QMainWindow):
         """解锁并进入待机状态：发送起飞脉冲后自动维持电机低频旋转."""
         if not self.ensure_unlocked("解锁待机"):
             return
+        wired_control = self.use_wired_control()
         profile = self.arm_profile_combo.currentText()
-        if "Cleanflight" in profile:
+        if wired_control:
+            profile_text = (
+                f"即将通过有线 MSP RC 发送摇杆解锁序列：油门最低 + 偏航最大，持续 {CLEANFLIGHT_ARM_DURATION:.0f} 秒。\n"
+                "完成后保持油门最低的有线待机。摄像图传仍通过 WiFi UDP。"
+            )
+        elif "Cleanflight" in profile:
             profile_text = (
                 f"即将发送 Cleanflight 摇杆解锁序列：油门最低 + 偏航最大，持续 {CLEANFLIGHT_ARM_DURATION:.0f} 秒。\n"
                 "完成后使用 M0 中位油门待机/控制。"
@@ -2316,7 +2536,14 @@ class MainWindow(QMainWindow):
             )
             == QMessageBox.Yes
         ):
-            self.open_udp()
+            if not self.prepare_control_link("解锁待机"):
+                return
+            if wired_control:
+                arm_state = ControlState(128, 128, WIRED_IDLE_THROTTLE, 255)
+                self.start_serial_rc_burst(arm_state, CLEANFLIGHT_ARM_DURATION, "有线摇杆解锁", True)
+                self.flight_armed = True
+                self.command_status.setText("当前命令：有线解锁中...")
+                return
             if self.wifi_worker:
                 # 先发心跳预热连接，确保无人机已就绪
                 self.wifi_worker.enqueue(("heartbeat",))
@@ -2357,8 +2584,18 @@ class MainWindow(QMainWindow):
         if not self.ensure_unlocked("锁定停机"):
             return
         if QMessageBox.question(self, "确认锁定", "即将发送降落/锁定指令，电机将停止。") == QMessageBox.Yes:
-            self.open_udp()
-            if self.wifi_worker:
+            if not self.prepare_control_link("锁定停机"):
+                return
+            if self.use_wired_control():
+                self.start_serial_rc_burst(
+                    ControlState(128, 128, WIRED_IDLE_THROTTLE, 0),
+                    2.0,
+                    "有线锁定",
+                    False,
+                )
+                self.flight_armed = False
+                self.command_status.setText("当前命令：有线锁定中...")
+            elif self.wifi_worker:
                 self.wifi_worker.enqueue(("hold_stop",))
                 self.wifi_worker.enqueue(("stop_stream",))
                 self.wifi_worker.enqueue(("burst", ControlState(), 2, "锁定", 1.0, False))
@@ -2379,8 +2616,18 @@ class MainWindow(QMainWindow):
             )
             == QMessageBox.Yes
         ):
-            self.open_udp()
-            if self.wifi_worker:
+            if not self.prepare_control_link("急停"):
+                return
+            if self.use_wired_control():
+                self.start_serial_rc_burst(
+                    ControlState(128, 128, WIRED_IDLE_THROTTLE, 0),
+                    2.0,
+                    "有线急停/锁定",
+                    False,
+                )
+                self.flight_armed = False
+                self.command_status.setText("当前命令：有线急停")
+            elif self.wifi_worker:
                 self.wifi_worker.enqueue(("hold_stop",))
                 self.wifi_worker.enqueue(("stop_stream",))
                 self.wifi_worker.enqueue(("burst", ControlState(), 4, "急停", 1.0))
@@ -2539,6 +2786,7 @@ class MainWindow(QMainWindow):
             )
             if hasattr(self, "wireless_sensor_check") and self.wireless_sensor_check.isChecked():
                 self.start_wireless_sensor_stream()
+            self.update_control_transport_status()
         elif "断开" in status or "错误" in status:
             if hasattr(self, "wireless_telemetry_timer"):
                 self.wireless_telemetry_timer.stop()
@@ -2551,6 +2799,7 @@ class MainWindow(QMainWindow):
                 "QLabel { background:#fef2f2; color:#991b1b; border:1px solid #fecaca; "
                 "border-radius:6px; padding:6px 10px; font-weight:500; }"
             )
+            self.update_control_transport_status()
         self.statusBar().showMessage(status, 4000)
 
     @Slot(str)
@@ -2571,11 +2820,13 @@ class MainWindow(QMainWindow):
                 self.set_metric("串口飞控", port_info)
             if hasattr(self, "wired_sensor_check") and self.wired_sensor_check.isChecked():
                 self.start_wired_sensor_stream()
+            self.update_control_transport_status()
         elif "未连接" in status or "失败" in status:
             if hasattr(self, "msp_timer"):
                 self.msp_timer.stop()
             if hasattr(self, "msp_poll_btn"):
                 self.msp_poll_btn.setText("开始 MSP 姿态轮询")
+            self.stop_serial_rc_control()
             self.serial_status.setStyleSheet(
                 "QLabel { background:#fef2f2; color:#991b1b; border:1px solid #fecaca; "
                 "border-radius:6px; padding:6px 10px; font-weight:500; }"
@@ -2586,6 +2837,7 @@ class MainWindow(QMainWindow):
                 "border-radius:6px; padding:6px 10px; font-weight:500; }"
             )
             self.set_metric("串口飞控", "未连接")
+            self.update_control_transport_status()
         self.statusBar().showMessage(status, 4000)
 
     @Slot(str)
