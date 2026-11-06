@@ -1,22 +1,17 @@
-# Qt6/PySide6 可运行测试版
+# Qt6 / PySide6 上位机（当前维护版本）
 
-这个目录是为了在当前电脑缺少 C++ 编译器时，仍然能完整运行和测试 Qt6 上位机。
+主程序：`qt_drone_station.py`。完整使用说明见仓库根目录 [README.md](../../README.md)。
 
-运行环境在项目内：
+从源码运行（在仓库根目录）：
 
 ```powershell
-E:\AI_project\slam\.venv_qt6\Scripts\python.exe E:\AI_project\slam\qt_ground_station\python_qt6\qt_drone_station.py
+python -m venv .venv_qt6
+.\.venv_qt6\Scripts\pip install -r requirements.txt
+.\.venv_qt6\Scripts\python qt_ground_station\python_qt6\qt_drone_station.py
+# 或：.\qt_ground_station\python_qt6\run_qt6_ground_station.ps1
 ```
 
-依赖和缓存位置：
+打包：仓库根目录执行 `.\build_exe.ps1`，输出 `dist\DroneGroundStation.exe`。
 
-- 虚拟环境：`E:\AI_project\slam\.venv_qt6`
-- pip 缓存：`E:\AI_project\slam\runtime\pip_cache`
-- 运行日志：`E:\AI_project\slam\runtime\qt6_logs`
-
-功能与 C++ Qt 工程保持一致：
-
-- WiFi UFO UDP 40000 心跳、信息包解析、视频分片与图像预览
-- COM9 / Cleanflight CLI 监控
-- 中文遥测表、日志、控制滑条、安全锁
-
+运行时文件：日志 `runtime\qt6_logs\`、设置 `runtime\settings.ini`、崩溃记录 `runtime\qt6_logs\crash.log`
+（目录不可写时改存 `%USERPROFILE%\.drone_ground_station\`；也可用环境变量 `DRONE_GS_RUNTIME_DIR` 指定）。

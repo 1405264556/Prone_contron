@@ -12,9 +12,11 @@ runtime/
 *.csv
 
 build/
+dist/
 build-*/
 cmake-build-*/
 /*.spec
+.venv*/
 *.user
 *.user.*
 *.autosave
